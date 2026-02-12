@@ -141,6 +141,7 @@ func (a *Avatar) Reupload(ctx context.Context, intent MatrixAPI, currentHash [32
 type UserInfo struct {
 	Identifiers  []string
 	Name         *string
+	FullName     *string
 	Avatar       *Avatar
 	IsBot        *bool
 	ExtraProfile database.ExtraProfile
