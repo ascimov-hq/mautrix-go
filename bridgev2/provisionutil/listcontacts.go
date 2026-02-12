@@ -64,6 +64,9 @@ func processResolveIdentifiers(ctx context.Context, br *bridgev2.Bridge, resp []
 			if contact.UserInfo.Name != nil {
 				apiContact.Name = *contact.UserInfo.Name
 			}
+			if contact.UserInfo.FullName != nil {
+				apiContact.FullName = *contact.UserInfo.FullName
+			}
 			if contact.UserInfo.Identifiers != nil {
 				apiContact.Identifiers = contact.UserInfo.Identifiers
 			}
