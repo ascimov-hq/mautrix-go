@@ -21,6 +21,7 @@ import (
 type RespResolveIdentifier struct {
 	ID          networkid.UserID    `json:"id"`
 	Name        string              `json:"name,omitempty"`
+	FullName    string              `json:"full_name,omitempty"`
 	AvatarURL   id.ContentURIString `json:"avatar_url,omitempty"`
 	Identifiers []string            `json:"identifiers,omitempty"`
 	MXID        id.UserID           `json:"mxid,omitempty"`
