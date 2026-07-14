@@ -43,6 +43,8 @@ type MemberEventContent struct {
 	MSC3414File                  *EncryptedFileInfo  `json:"org.matrix.msc3414.file,omitempty"`
 
 	MSC4293RedactEvents bool `json:"org.matrix.msc4293.redact_events,omitzero"`
+
+	BridgeIdentifiers []string `json:"com.zeldin.bridge_ids,omitempty"`
 }
 
 type SignedThirdPartyInvite struct {
