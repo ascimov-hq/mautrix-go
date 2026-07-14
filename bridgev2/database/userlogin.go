@@ -30,27 +30,28 @@ type UserLogin struct {
 	RemoteName    string
 	RemoteProfile status.RemoteProfile
 	SpaceRoom     id.RoomID
+	Identifiers   []string
 	Metadata      any
 }
 
 const (
 	getUserLoginBaseQuery = `
-		SELECT bridge_id, user_mxid, id, remote_name, remote_profile, space_room, metadata FROM user_login
+		SELECT bridge_id, user_mxid, id, remote_name, remote_profile, space_room, identifiers, metadata FROM user_login
 	`
 	getLoginByIDQuery          = getUserLoginBaseQuery + `WHERE bridge_id=$1 AND id=$2`
 	getAllUsersWithLoginsQuery = `SELECT DISTINCT user_mxid FROM user_login WHERE bridge_id=$1`
 	getAllLoginsForUserQuery   = getUserLoginBaseQuery + `WHERE bridge_id=$1 AND user_mxid=$2`
 	getAllLoginsInPortalQuery  = `
-		SELECT ul.bridge_id, ul.user_mxid, ul.id, ul.remote_name, ul.remote_profile, ul.space_room, ul.metadata FROM user_portal
+		SELECT ul.bridge_id, ul.user_mxid, ul.id, ul.remote_name, ul.remote_profile, ul.space_room, ul.identifiers, ul.metadata FROM user_portal
 		LEFT JOIN user_login ul ON user_portal.bridge_id=ul.bridge_id AND user_portal.user_mxid=ul.user_mxid AND user_portal.login_id=ul.id
 		WHERE user_portal.bridge_id=$1 AND user_portal.portal_id=$2 AND user_portal.portal_receiver=$3
 	`
 	insertUserLoginQuery = `
-		INSERT INTO user_login (bridge_id, user_mxid, id, remote_name, remote_profile, space_room, metadata)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		INSERT INTO user_login (bridge_id, user_mxid, id, remote_name, remote_profile, space_room, identifiers, metadata)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 	`
 	updateUserLoginQuery = `
-		UPDATE user_login SET remote_name=$4, remote_profile=$5, space_room=$6, metadata=$7
+		UPDATE user_login SET remote_name=$4, remote_profile=$5, space_room=$6, identifiers=$7, metadata=$8
 		WHERE bridge_id=$1 AND user_mxid=$2 AND id=$3
 	`
 	deleteUserLoginQuery = `
@@ -98,6 +99,7 @@ func (u *UserLogin) Scan(row dbutil.Scannable) (*UserLogin, error) {
 		&u.RemoteName,
 		dbutil.JSON{Data: &u.RemoteProfile},
 		&spaceRoom,
+		dbutil.JSON{Data: &u.Identifiers},
 		dbutil.JSON{Data: u.Metadata},
 	)
 	if err != nil {
@@ -119,5 +121,5 @@ func (u *UserLogin) sqlVariables() []any {
 	if !u.RemoteProfile.IsZero() {
 		remoteProfile.Data = &u.RemoteProfile
 	}
-	return []any{u.BridgeID, u.UserMXID, u.ID, u.RemoteName, remoteProfile, dbutil.StrPtr(u.SpaceRoom), dbutil.JSON{Data: u.Metadata}}
+	return []any{u.BridgeID, u.UserMXID, u.ID, u.RemoteName, remoteProfile, dbutil.StrPtr(u.SpaceRoom), dbutil.JSON{Data: &u.Identifiers}, dbutil.JSON{Data: u.Metadata}}
 }

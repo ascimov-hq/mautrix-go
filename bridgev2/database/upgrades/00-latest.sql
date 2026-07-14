@@ -1,4 +1,4 @@
--- v0 -> v29 (compatible with v9+): Latest revision
+-- v0 -> v30 (compatible with v9+): Latest revision
 CREATE TABLE "user" (
 	bridge_id       TEXT NOT NULL,
 	mxid            TEXT NOT NULL,
@@ -16,6 +16,7 @@ CREATE TABLE user_login (
 	remote_name    TEXT  NOT NULL,
 	remote_profile jsonb,
 	space_room     TEXT,
+	identifiers    jsonb,
 	metadata       jsonb NOT NULL,
 
 	PRIMARY KEY (bridge_id, id),
