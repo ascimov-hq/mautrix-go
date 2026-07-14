@@ -289,6 +289,15 @@ type IdentifierValidatingNetwork interface {
 	ValidateUserID(id networkid.UserID) bool
 }
 
+// IdentifierResolver is an optional interface that a NetworkAPI can implement to
+// map a remote user ID to real-world identifiers like "tel:+1234567890". They are
+// added to the user's m.room.member event under "com.zeldin.bridge_ids" as optional
+// extra info, so clients can match members against device contacts or other
+// external sources to enrich them. Return nil if the user has none.
+type IdentifierResolver interface {
+	ResolveIdentifiers(ctx context.Context, userID networkid.UserID) []string
+}
+
 type TransactionIDGeneratingNetwork interface {
 	NetworkConnector
 	GenerateTransactionID(userID id.UserID, roomID id.RoomID, eventType event.Type) networkid.RawTransactionID
