@@ -286,24 +286,13 @@ type IdentifierValidatingNetwork interface {
 	ValidateUserID(id networkid.UserID) bool
 }
 
-// IdentifierResolver is an optional interface that a NetworkAPI can implement
-// to return stable identifier strings (e.g. "tel:+1234567890", "lid:987654321")
-// for a remote network user. The framework calls this for every member of every
-// chat it syncs and stamps the result into the m.room.member state event under
-// the "com.zeldin.ai.bridge.identifiers" key.
-//
-// Returning nil means "this user has no identifiers". An empty slice is not
-// meaningful here — return nil instead.
+// IdentifierResolver is an optional interface that a NetworkAPI can implement to
+// map a remote user ID to real-world identifiers like "tel:+1234567890". They are
+// added to the user's m.room.member event under "com.zeldin.bridge_ids" as optional
+// extra info, so clients can match members against device contacts or other
+// external sources to enrich them. Return nil if the user has none.
 type IdentifierResolver interface {
 	ResolveIdentifiers(ctx context.Context, userID networkid.UserID) []string
-}
-
-// UserLoginIdentifierResolver is an optional interface that a NetworkAPI can
-// implement to return stable identifiers for the bridge user themselves (e.g.
-// their own phone number). The framework calls this for real Matrix users who
-// are logged into the bridge and appear in a bridged room.
-type UserLoginIdentifierResolver interface {
-	ResolveLoginIdentifiers(ctx context.Context) []string
 }
 
 type TransactionIDGeneratingNetwork interface {

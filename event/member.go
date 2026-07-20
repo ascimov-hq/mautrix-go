@@ -44,7 +44,7 @@ type MemberEventContent struct {
 
 	MSC4293RedactEvents bool `json:"org.matrix.msc4293.redact_events,omitempty"`
 
-	ZeldinIdentifiers []string `json:"com.zeldin.bridge.identifiers,omitempty"`
+	BridgeIdentifiers []string `json:"com.zeldin.bridge_ids,omitempty"`
 }
 
 type SignedThirdPartyInvite struct {

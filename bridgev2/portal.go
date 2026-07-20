@@ -4012,9 +4012,7 @@ type ChatMember struct {
 	PowerLevel *int
 	// Optional user info to sync the ghost user while updating membership.
 	UserInfo *UserInfo
-	// Identifiers overrides ResolveIdentifiers for this member if non-nil.
-	// When set, these are stamped directly onto the m.room.member state event
-	// under "com.zeldin.bridge.identifiers" without calling the resolver.
+	// Identifiers from the bridge that is to be exposed "com.zeldin.bridge_ids" in m.room.member state event
 	Identifiers []string
 	// The user who sent the membership change (user who invited/kicked/banned this user).
 	// Not yet used. Not applicable if Membership is join or knock.
@@ -4749,7 +4747,6 @@ func (portal *Portal) syncParticipants(
 				ghost.UpdateInfo(ctx, member.UserInfo)
 			}
 		}
-		// Resolve identifiers and stamp onto the m.room.member state event.
 		var memberIdentifiers []string
 		if member.Identifiers != nil {
 			memberIdentifiers = member.Identifiers
@@ -4762,7 +4759,7 @@ func (portal *Portal) syncParticipants(
 			if member.MemberEventExtra == nil {
 				member.MemberEventExtra = make(map[string]any)
 			}
-			member.MemberEventExtra["com.zeldin.bridge.identifiers"] = memberIdentifiers
+			member.MemberEventExtra["com.zeldin.bridge_ids"] = memberIdentifiers
 		}
 		intent, extraUserID, err := portal.getIntentAndUserMXIDFor(ctx, member.EventSender, source, loginsInPortal, 0)
 		if err != nil {
