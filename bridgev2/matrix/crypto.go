@@ -307,9 +307,13 @@ func (helper *CryptoHelper) allowKeyShare(ctx context.Context, device *id.Device
 			zerolog.Ctx(ctx).Debug().Msg("Couldn't find user to handle key request")
 			return &crypto.KeyShareRejectNoResponse
 		} else if !user.Permissions.Admin {
-			zerolog.Ctx(ctx).Debug().Msg("Rejecting key request: user is not admin")
-			// TODO is in room check?
-			return &crypto.KeyShareRejection{Code: event.RoomKeyWithheldUnauthorized, Reason: "Key sharing for non-admins is not yet implemented"}
+			if !helper.bridge.StateStore.IsInRoom(ctx, info.RoomID, device.UserID) {
+				zerolog.Ctx(ctx).Debug().
+					Stringer("user_id", device.UserID).
+					Stringer("room_id", info.RoomID).
+					Msg("Rejecting key request: user is not admin and not in room")
+				return &crypto.KeyShareRejection{Code: event.RoomKeyWithheldUnauthorized, Reason: "User is not a member of the room"}
+			}
 		}
 		zerolog.Ctx(ctx).Debug().Msg("Accepting key request")
 		return nil
