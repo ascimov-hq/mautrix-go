@@ -94,6 +94,23 @@ var (
 // Common login interface errors
 var (
 	ErrInvalidLoginFlowID error = RespError(mautrix.MNotFound.WithMessage("Invalid login flow ID"))
+
+	// ErrLoginSuperseded is returned for a login process that was cancelled because a newer login process
+	// was started for the same Matrix user (by the provisioning API) or for the same remote account
+	// (network connectors may return it, e.g. a newer pairing code request for the same phone number).
+	// The provisioning API keeps answering step requests for such a process with this error for a few minutes.
+	ErrLoginSuperseded = RespError{
+		ErrCode:    "FI.MAU.BRIDGE.LOGIN_SUPERSEDED",
+		Err:        "Login process was replaced by a newer login process",
+		StatusCode: http.StatusGone,
+	}
+	// ErrAlreadyLoggedIn can be returned by network connectors when the user tries to log into a remote account
+	// that already has a connected login, and the login process wasn't started as an explicit re-login of it.
+	ErrAlreadyLoggedIn = RespError{
+		ErrCode:    "FI.MAU.BRIDGE.ALREADY_LOGGED_IN",
+		Err:        "That account is already logged in",
+		StatusCode: http.StatusConflict,
+	}
 )
 
 // RespError is a class of error that certain network interface methods can return to ensure that the error

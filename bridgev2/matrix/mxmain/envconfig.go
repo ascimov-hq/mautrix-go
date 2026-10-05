@@ -13,10 +13,12 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 
 	"go.mau.fi/util/random"
 
 	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/matrix"
 )
 
 func LoadGlobalConfigEnv() {
@@ -31,6 +33,16 @@ func LoadGlobalConfigEnv() {
 	ehtt, err := strconv.Atoi(os.Getenv("MAUTRIX_EVENT_HANDLING_TIMEOUT_TICKS"))
 	if err == nil && ehtt > 0 {
 		bridgev2.EventHandlingTimeoutTicks = ehtt
+	}
+	// intbox: per-room ordered dispatch of Matrix events with async_transactions: false, see matrix.PerRoomEventDispatch
+	prd, err := strconv.ParseBool(os.Getenv("MAUTRIX_PER_ROOM_DISPATCH"))
+	if err == nil {
+		matrix.PerRoomEventDispatch = prd
+	}
+	// intbox: how long a bridge stop waits for portal events to finish (0 disables it), see bridgev2.ShutdownDrainTimeout
+	sdt, err := strconv.Atoi(os.Getenv("MAUTRIX_SHUTDOWN_DRAIN_SECONDS"))
+	if err == nil && sdt >= 0 {
+		bridgev2.ShutdownDrainTimeout = time.Duration(sdt) * time.Second
 	}
 }
 

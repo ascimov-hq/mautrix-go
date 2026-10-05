@@ -560,6 +560,8 @@ func (cli *Client) MakeFullRequestWithResp(ctx context.Context, params FullReque
 	if len(cli.AccessToken) > 0 {
 		req.Header.Set("Authorization", "Bearer "+cli.AccessToken)
 	}
+	// Retries reuse the same request, so they keep the lane headers too.
+	setIntboxHeaders(ctx, req)
 	if params.ResponseSizeLimit == 0 {
 		params.ResponseSizeLimit = cli.ResponseSizeLimit
 	}
@@ -1290,8 +1292,16 @@ func (cli *Client) GetRoomSummary(ctx context.Context, roomIDOrAlias string, via
 }
 
 // GetDisplayName returns the display name of the user with the specified MXID. See https://spec.matrix.org/v1.2/client-server-api/#get_matrixclientv3profileuseriddisplayname
+//
+// An unset displayname is returned as an empty string without an error: homeservers that answer 404 M_NOT_FOUND
+// for unset profile fields (e.g. Tuwunel >= 1.8.3, as the spec allows) behave like ones that answer 200 {}.
+// (Port of upstream 3242145.)
 func (cli *Client) GetDisplayName(ctx context.Context, mxid id.UserID) (resp *RespUserDisplayName, err error) {
+	resp = &RespUserDisplayName{}
 	err = cli.GetProfileField(ctx, mxid, "displayname", &resp)
+	if errors.Is(err, MNotFound) {
+		err = nil
+	}
 	return
 }
 
@@ -1338,11 +1348,17 @@ func (cli *Client) GetProfileField(ctx context.Context, userID id.UserID, key st
 }
 
 // GetAvatarURL gets the avatar URL of the user with the specified MXID. See https://spec.matrix.org/v1.2/client-server-api/#get_matrixclientv3profileuseridavatar_url
+//
+// An unset avatar is returned as an empty URI without an error, also when the homeserver answers 404 M_NOT_FOUND
+// for the unset field (e.g. Tuwunel >= 1.8.3). (Port of upstream 3242145.)
 func (cli *Client) GetAvatarURL(ctx context.Context, mxid id.UserID) (url id.ContentURI, err error) {
 	s := struct {
 		AvatarURL id.ContentURI `json:"avatar_url"`
 	}{}
 	err = cli.GetProfileField(ctx, mxid, "avatar_url", &s)
+	if errors.Is(err, MNotFound) {
+		err = nil
+	}
 	url = s.AvatarURL
 	return
 }

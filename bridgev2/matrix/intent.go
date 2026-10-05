@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"go.mau.fi/util/exmaps"
 	"go.mau.fi/util/fallocate"
 	"go.mau.fi/util/ptr"
 	"golang.org/x/exp/slices"
@@ -547,6 +548,9 @@ func (as *ASIntent) EnsureJoined(ctx context.Context, roomID id.RoomID, extra ..
 	if len(extra) > 0 {
 		params = extra[0]
 	}
+	if params.MemberEventExtra != nil && as.ensureJoinedWithMemberEvent(ctx, roomID, params.MemberEventExtra) {
+		return nil
+	}
 	err := as.Matrix.EnsureJoined(ctx, roomID, appservice.EnsureJoinedParams{Via: params.Via})
 	if err != nil {
 		return err
@@ -558,6 +562,60 @@ func (as *ASIntent) EnsureJoined(ctx context.Context, roomID id.RoomID, extra ..
 		}
 	}
 	return nil
+}
+
+// ensureJoinedWithMemberEvent joins a ghost to a room by having the bridge bot invite it and then sending
+// the ghost's own join event, both with the given extra content. This produces the same member events as
+// the eager member list sync, and avoids the plain /join that always fails in private portal rooms.
+//
+// Returns true if the user is now joined. If false is returned, the caller should fall back to the normal join flow.
+func (as *ASIntent) ensureJoinedWithMemberEvent(ctx context.Context, roomID id.RoomID, getExtra func(ctx context.Context) map[string]any) bool {
+	userID := as.Matrix.UserID
+	if as.Matrix.IsCustomPuppet || userID == as.Connector.Bot.UserID {
+		return false
+	}
+	stateStore := as.Connector.AS.StateStore
+	if stateStore.IsInRoom(ctx, roomID, userID) {
+		return true
+	}
+	log := zerolog.Ctx(ctx).With().
+		Str("action", "join ghost with member event").
+		Stringer("room_id", roomID).
+		Stringer("user_id", userID).
+		Logger()
+	if err := as.Matrix.EnsureRegistered(ctx); err != nil {
+		log.Warn().Err(err).Msg("Failed to ensure ghost is registered, falling back to normal join")
+		return false
+	}
+	extra := getExtra(ctx)
+	// Only invite if the user isn't already invited (IsInvited is also true for joined users)
+	if !stateStore.IsInvited(ctx, roomID, userID) {
+		inviteContent := &event.Content{
+			Parsed: &event.MemberEventContent{Membership: event.MembershipInvite},
+			Raw:    exmaps.NonNilClone(extra),
+		}
+		inviteContent.Raw["fi.mau.will_auto_accept"] = true
+		_, err := as.Connector.Bridge.Bot.SendState(ctx, roomID, event.StateMember, userID.String(), inviteContent, time.Time{})
+		if err != nil {
+			log.Warn().Err(err).Msg("Failed to invite ghost with member event, falling back to normal join")
+			return false
+		} else if stateStore.IsInRoom(ctx, roomID, userID) {
+			// The invite revealed that the user was already in the room
+			return true
+		}
+	}
+	joinContent := &event.Content{
+		Parsed: &event.MemberEventContent{Membership: event.MembershipJoin},
+		Raw:    exmaps.NonNilClone(extra),
+	}
+	// SendState fills the displayname and avatar, and the state store is updated after a successful send.
+	_, err := as.SendState(ctx, roomID, event.StateMember, userID.String(), joinContent, time.Time{})
+	if err != nil {
+		log.Warn().Err(err).Msg("Failed to join ghost with member event, falling back to normal join")
+		return false
+	}
+	log.Debug().Msg("Joined ghost to room with member event")
+	return true
 }
 
 func (as *ASIntent) EnsureInvited(ctx context.Context, roomID id.RoomID, userID id.UserID) error {

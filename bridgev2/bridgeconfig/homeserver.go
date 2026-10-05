@@ -37,4 +37,6 @@ type HomeserverConfig struct {
 	WSPingInterval int    `yaml:"ping_interval_seconds"`
 
 	RetryLimit int `yaml:"retry_limit"`
+
+	MaxConnectionsPerPool int `yaml:"max_connections_per_pool"`
 }

@@ -21,6 +21,7 @@ import (
 	"go.mau.fi/util/exerrors"
 	"go.mau.fi/util/exmime"
 
+	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/event"
@@ -57,12 +58,18 @@ func (br *Bridge) loadGhost(ctx context.Context, dbGhost *database.Ghost, queryE
 		Log:    br.Log.With().Str("ghost_id", string(dbGhost.ID)).Logger(),
 		Intent: br.Matrix.GhostIntent(dbGhost.ID),
 	}
-	br.ghostsByID[ghost.ID] = ghost
+	br.ghostsByID.Put(ghost)
 	return ghost, nil
 }
 
+func (br *Bridge) onGhostEvicted(ghost *Ghost) {
+	if evictor, ok := br.Matrix.(MatrixConnectorWithGhostEviction); ok {
+		evictor.ForgetGhost(ghost.ID)
+	}
+}
+
 func (br *Bridge) unlockedGetGhostByID(ctx context.Context, id networkid.UserID, onlyIfExists bool) (*Ghost, error) {
-	cached, ok := br.ghostsByID[id]
+	cached, ok := br.ghostsByID.Get(id)
 	if ok {
 		return cached, nil
 	}
@@ -296,6 +303,7 @@ func (ghost *Ghost) UpdateInfoIfNecessary(ctx context.Context, source *UserLogin
 	if ghost.Name != "" && ghost.NameSet && ghost.AvatarSet && !ghost.Bridge.allowAggressiveUpdateForType(evtType) {
 		return
 	}
+	ctx = WithIntboxLane(ctx, mautrix.IntboxLaneBulk, source)
 	info, err := source.Client.GetUserInfo(ctx, ghost)
 	if err != nil {
 		zerolog.Ctx(ctx).Err(err).Str("ghost_id", string(ghost.ID)).Msg("Failed to get info to update ghost")
@@ -326,12 +334,19 @@ func (ghost *Ghost) updateDMPortals(ctx context.Context) {
 		zerolog.Ctx(ctx).Err(err).Msg("Failed to get DM portals to update info")
 		return
 	}
+	// intbox: the updates run in the background, after the caller may have returned. The caller's context is often
+	// canceled then: during portal creation it's createMatrixRoomInLoop's cancellable context, which is canceled
+	// as soon as the room exists, and the goroutine (waiting for roomCreateLock until then) failed its bot join
+	// with "context canceled" (823 "Failed to set room metadata" in one load-test wave). Keep the values (logger,
+	// request lane), drop the cancellation.
+	ctx = context.WithoutCancel(ctx)
 	for _, portal := range dmPortals {
 		go portal.lockedUpdateInfoFromGhost(ctx, ghost)
 	}
 }
 
 func (ghost *Ghost) UpdateInfo(ctx context.Context, info *UserInfo) {
+	ctx = WithIntboxLane(ctx, mautrix.IntboxLaneBulk, nil)
 	oldName := ghost.Name
 	oldAvatar := ghost.AvatarMXC
 

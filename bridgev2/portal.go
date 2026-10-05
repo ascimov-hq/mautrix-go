@@ -354,6 +354,19 @@ func (portal *Portal) queueEvent(ctx context.Context, evt portalEvent) EventHand
 	if portal.backgroundCtx.Err() != nil {
 		return EventHandlingResultIgnored
 	}
+	// intbox: Matrix events are counted from here until their handler has finished, so that Stop can wait for them
+	// before it disconnects the logins (lifecycle_intbox.go). The handler's callback in
+	// handleSingleEventWithDelayLogging takes the count back down; an event that's dropped here is uncounted here.
+	_, isMatrix := evt.(*portalMatrixEvent)
+	if isMatrix {
+		portal.Bridge.matrixPortalEvents.Add(1)
+	}
+	dropped := func() EventHandlingResult {
+		if isMatrix {
+			portal.Bridge.matrixPortalEvents.Add(-1)
+		}
+		return EventHandlingResultIgnored
+	}
 	if PortalEventBuffer == 0 {
 		portal.eventsLock.Lock()
 		defer portal.eventsLock.Unlock()
@@ -367,7 +380,7 @@ func (portal *Portal) queueEvent(ctx context.Context, evt portalEvent) EventHand
 		case portal.events <- evt:
 			return EventHandlingResultQueued
 		case <-portal.deleted:
-			return EventHandlingResultIgnored
+			return dropped()
 		default:
 			zerolog.Ctx(ctx).Error().
 				Str("portal_id", string(portal.ID)).
@@ -377,7 +390,7 @@ func (portal *Portal) queueEvent(ctx context.Context, evt portalEvent) EventHand
 				case portal.events <- evt:
 					return EventHandlingResultQueued
 				case <-portal.deleted:
-					return EventHandlingResultIgnored
+					return dropped()
 				case <-time.After(5 * time.Second):
 					zerolog.Ctx(ctx).Error().
 						Str("portal_id", string(portal.ID)).
@@ -420,7 +433,15 @@ func (portal *Portal) handleSingleEventWithDelayLogging(idx int, rawEvt any) (ou
 	var handleDuration time.Duration
 	// Note: this will assume success if the handler times out
 	outerRes = EventHandlingResult{Queued: true, Success: true, Error: ErrHandlerBackgrounded}
+	// intbox: counted for the shutdown drain (lifecycle_intbox.go); handleSingleEvent calls the callback exactly once,
+	// also after a panic.
+	portal.Bridge.activePortalEvents.Add(1)
+	_, isMatrixEvt := rawEvt.(*portalMatrixEvent)
 	go portal.handleSingleEvent(ctx, rawEvt, func(res EventHandlingResult) {
+		portal.Bridge.activePortalEvents.Add(-1)
+		if isMatrixEvt {
+			portal.Bridge.matrixPortalEvents.Add(-1)
+		}
 		if res.Error != nil && portal.backgroundCtx.Err() != nil {
 			res = EventHandlingResultIgnored
 		}
@@ -534,6 +555,7 @@ func (portal *Portal) getEventCtxWithLog(rawEvt any, idx int) context.Context {
 		ctx := portal.backgroundCtx
 		ctx = context.WithValue(ctx, contextKeyRemoteEvent, evt.evt)
 		ctx = logWith.Logger().WithContext(ctx)
+		ctx = mautrix.WithIntboxLogin(ctx, string(evt.source.ID))
 		if ctxMut, ok := evt.evt.(RemoteEventWithContextMutation); ok {
 			ctx = ctxMut.MutateContext(ctx)
 		}
@@ -763,10 +785,18 @@ func (portal *Portal) handleMatrixEvent(ctx context.Context, sender *User, evt *
 		// Tombstones aren't bridged so they don't need a login
 		return portal.handleMatrixTombstone(ctx, evt)
 	}
-	login, userPortal, err := portal.FindPreferredLogin(ctx, sender, true)
+	login, userPortal, err := portal.findPreferredLoginForMatrixEvent(ctx, sender, true)
 	if err != nil {
 		log.Err(err).Msg("Failed to get user login to handle Matrix event")
-		if errors.Is(err, ErrNotLoggedIn) {
+		if errors.Is(err, ErrNotLoggedIn) && portal.Bridge.IsStopping() {
+			// intbox: the logins were disconnected by a bridge shutdown (the Matrix drain in Stop timed out), the
+			// user isn't logged out: no "You're not logged in" notice, and a status that isn't certain.
+			return EventHandlingResultFailed.WithMSSError(WrapErrorInStatus(err).
+				WithMessage("The bridge is restarting, the message wasn't sent").
+				WithStatus(event.MessageStatusRetriable).
+				WithIsCertain(false).
+				WithSendNotice(false))
+		} else if errors.Is(err, ErrNotLoggedIn) {
 			shouldSendNotice := evt.Type == event.EventMessage && evt.Content.AsMessage().MsgType != event.MsgNotice
 			return EventHandlingResultFailed.WithMSSError(WrapErrorInStatus(err).
 				WithMessage(fmt.Sprintf("You're %s", err)).
@@ -829,6 +859,7 @@ func (portal *Portal) handleMatrixEvent(ctx context.Context, sender *User, evt *
 	}
 	// Copy logger because many of the handlers will use UpdateContext
 	ctx = log.With().Str("login_id", string(login.ID)).Logger().WithContext(ctx)
+	ctx = mautrix.WithIntboxLogin(ctx, string(login.ID))
 
 	if origSender == nil && portal.Bridge.Network.GetCapabilities().ImplicitReadReceipts && !evt.Type.IsAccountData() {
 		rrLog := log.With().Str("subaction", "implicit read receipt").Logger()
@@ -2739,8 +2770,71 @@ func (portal *Portal) GetIntentFor(ctx context.Context, sender EventSender, sour
 		if intent == nil {
 			panic(fmt.Errorf("bridge bot is nil"))
 		}
+	} else {
+		portal.lazyJoinGhost(ctx, intent, source, evtType)
 	}
 	return intent, true
+}
+
+// lazyJoinGhost makes sure that the ghost of a remote sender is joined to the portal room before it's used,
+// using an invite and a join event that carry the same extra content (com.zeldin.bridge_ids) as the eager member
+// list sync. Without this, a ghost that wasn't synced eagerly (e.g. because of a member sync limit) would be joined
+// by the send path with a plain /join that fails, followed by an invite and a join without any identifiers.
+func (portal *Portal) lazyJoinGhost(ctx context.Context, intent MatrixAPI, source *UserLogin, evtType RemoteEventType) {
+	if !portal.Bridge.Config.LazyJoinWithInvite || portal.MXID == "" || source == nil || intent.IsDoublePuppet() {
+		return
+	}
+	switch evtType {
+	case RemoteEventMessage, RemoteEventMessageUpsert, RemoteEventEdit, RemoteEventReaction, RemoteEventReactionSync,
+		RemoteEventReactionRemove, RemoteEventMessageRemove, RemoteEventChatInfoChange:
+	default:
+		return
+	}
+	ghostID, isGhost := portal.Bridge.Matrix.ParseGhostMXID(intent.GetMXID())
+	if !isGhost || ghostID == "" {
+		return
+	}
+	err := intent.EnsureJoined(ctx, portal.MXID, EnsureJoinedParams{
+		MemberEventExtra: func(ctx context.Context) map[string]any {
+			extra := map[string]any{
+				"com.beeper.exclude_from_timeline": true,
+			}
+			if resolver, ok := source.Client.(IdentifierResolver); ok {
+				if identifiers := resolver.ResolveIdentifiers(ctx, ghostID); len(identifiers) > 0 {
+					extra["com.zeldin.bridge_ids"] = identifiers
+				}
+			}
+			return extra
+		},
+	})
+	if err != nil {
+		zerolog.Ctx(ctx).Err(err).
+			Stringer("user_id", intent.GetMXID()).
+			Msg("Failed to ensure ghost is joined to portal")
+	}
+}
+
+// isNonMemberGhostSender checks if the sender is a remote user whose ghost isn't joined to the portal room.
+// If bridge.ignore_ephemeral_from_non_members is enabled, read receipts and typing notifications from such users
+// are ignored, so that silent members of large groups don't cause ghosts to be created, registered and joined.
+func (portal *Portal) isNonMemberGhostSender(ctx context.Context, sender EventSender) bool {
+	if !portal.Bridge.Config.IgnoreNonMemberEphemeral || portal.MXID == "" || portal.RoomType == database.RoomTypeDM ||
+		sender.IsFromMe || sender.SenderLogin != "" || sender.Sender == "" || sender.ForceDMUser {
+		return false
+	}
+	ghost, err := portal.Bridge.GetExistingGhostByID(ctx, sender.Sender)
+	if err != nil {
+		zerolog.Ctx(ctx).Err(err).Msg("Failed to get ghost to check if it's joined")
+		return false
+	} else if ghost == nil {
+		return true
+	}
+	member, err := portal.Bridge.Matrix.GetMemberInfo(ctx, portal.MXID, ghost.Intent.GetMXID())
+	if err != nil {
+		zerolog.Ctx(ctx).Err(err).Msg("Failed to get member info to check if ghost is joined")
+		return false
+	}
+	return member == nil || member.Membership != event.MembershipJoin
 }
 
 func (portal *Portal) getRelationMeta(
@@ -3659,6 +3753,10 @@ func (portal *Portal) redactMessageParts(
 
 func (portal *Portal) handleRemoteReadReceipt(ctx context.Context, source *UserLogin, evt RemoteReadReceipt) EventHandlingResult {
 	log := zerolog.Ctx(ctx)
+	if portal.isNonMemberGhostSender(ctx, evt.GetSender()) {
+		log.Debug().Msg("Ignoring read receipt from user who isn't joined to the portal")
+		return EventHandlingResultIgnored
+	}
 	var err error
 	var lastTarget *database.Message
 	readUpTo := evt.GetReadUpTo()
@@ -3795,6 +3893,10 @@ func (portal *Portal) handleRemoteTyping(ctx context.Context, source *UserLogin,
 	if typedEvt, ok := evt.(RemoteTypingWithType); ok {
 		typingType = typedEvt.GetTypingType()
 	}
+	if portal.isNonMemberGhostSender(ctx, evt.GetSender()) {
+		zerolog.Ctx(ctx).Debug().Msg("Ignoring typing notification from user who isn't joined to the portal")
+		return EventHandlingResultIgnored
+	}
 	intent, ok := portal.GetIntentFor(ctx, evt.GetSender(), source, RemoteEventTyping)
 	if !ok {
 		return EventHandlingResultFailed.WithError(ErrFailedToGetIntent)
@@ -3824,6 +3926,7 @@ func (portal *Portal) handleRemoteChatInfoChange(ctx context.Context, source *Us
 }
 
 func (portal *Portal) handleRemoteChatResync(ctx context.Context, source *UserLogin, evt RemoteChatResync) EventHandlingResult {
+	ctx = WithIntboxLane(ctx, mautrix.IntboxLaneBulk, source)
 	log := zerolog.Ctx(ctx)
 	infoProvider, ok := evt.(RemoteChatResyncWithInfo)
 	if ok {
@@ -3985,6 +4088,7 @@ type ChatInfoChange struct {
 }
 
 func (portal *Portal) ProcessChatInfoChange(ctx context.Context, sender EventSender, source *UserLogin, change *ChatInfoChange, ts time.Time) {
+	ctx = WithIntboxLane(ctx, mautrix.IntboxLaneBulk, source)
 	intent, ok := portal.GetIntentFor(ctx, sender, source, RemoteEventChatInfoChange)
 	if !ok {
 		return
@@ -4598,6 +4702,7 @@ func (portal *Portal) syncParticipants(
 	sender MatrixAPI,
 	ts time.Time,
 ) error {
+	ctx = WithIntboxLane(ctx, mautrix.IntboxLaneBulk, source)
 	members.memberListToMap(ctx)
 	var loginsInPortal []*UserLogin
 	var err error
@@ -4998,15 +5103,21 @@ func (portal *Portal) UpdateInfoFromGhost(ctx context.Context, ghost *Ghost) (ch
 	}
 	changed = portal.updateName(ctx, ghost.Name, nil, time.Time{}, false) || changed
 	changed = portal.updateAvatar(ctx, &Avatar{
-		ID:     ghost.AvatarID,
-		MXC:    ghost.AvatarMXC,
-		Hash:   ghost.AvatarHash,
-		Remove: ghost.AvatarID == "",
+		ID:   ghost.AvatarID,
+		MXC:  ghost.AvatarMXC,
+		Hash: ghost.AvatarHash,
+		// intbox: upstream used AvatarID == "". A ghost can have an avatar ID without an MXC: "remove" and
+		// "unauthorized", or an avatar whose reupload failed. The portal then tried to reupload an avatar that has no
+		// Get function and logged "Failed to reupload room avatar: no Get function provided for avatar" every time
+		// (1,074 in one load-test wave). The ghost's Matrix avatar is empty in all these cases, so the DM's is too;
+		// when the ghost gets an MXC later, Ghost.UpdateInfo updates its DM portals again.
+		Remove: ghost.AvatarMXC == "",
 	}, nil, time.Time{}, false) || changed
 	return
 }
 
 func (portal *Portal) UpdateInfo(ctx context.Context, info *ChatInfo, source *UserLogin, sender MatrixAPI, ts time.Time) {
+	ctx = WithIntboxLane(ctx, mautrix.IntboxLaneBulk, source)
 	changed := false
 	if info.Name == DefaultChatName {
 		if portal.NameIsCustom {
@@ -5164,6 +5275,7 @@ func (portal *Portal) CreateMatrixRoom(ctx context.Context, source *UserLogin, i
 }
 
 func (portal *Portal) createMatrixRoomInLoop(ctx context.Context, source *UserLogin, info *ChatInfo, backfillBundle any) error {
+	ctx = WithIntboxLane(ctx, mautrix.IntboxLaneBulk, source)
 	cancellableCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	portal.cancelRoomCreate.CompareAndSwap(nil, &cancel)

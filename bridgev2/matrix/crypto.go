@@ -16,6 +16,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lib/pq"
@@ -388,12 +389,32 @@ func (helper *CryptoHelper) Start() {
 	helper.log.Debug().Msg("Starting syncer for receiving to-device messages")
 	var ctx context.Context
 	ctx, helper.cancelSync = context.WithCancel(context.Background())
-	err := helper.client.SyncWithContext(ctx)
-	if err != nil && !errors.Is(err, context.Canceled) {
-		helper.log.WithLevel(zerolog.FatalLevel).Err(err).Msg("Fatal error syncing")
-		os.Exit(51)
-	} else {
-		helper.log.Info().Msg("Bridge bot to-device syncer stopped without error")
+	for {
+		err := helper.client.SyncWithContext(ctx)
+		if errors.Is(err, errCryptoSyncStuck) && ctx.Err() == nil {
+			// intbox: see crypto_syncrecovery.go
+			helper.log.Warn().Err(err).
+				Int("consecutive_timeouts", cryptoSyncStuckThreshold).
+				Msg("Bridge bot /sync is stuck on one token, recovering with a narrowed sync")
+			if rerr := helper.recoverStuckSync(ctx); rerr != nil && ctx.Err() == nil {
+				helper.log.Err(rerr).Msg("Failed to recover stuck bridge bot /sync, resuming the normal sync")
+				select {
+				case <-ctx.Done():
+				case <-time.After(10 * time.Second):
+				}
+			}
+			if ctx.Err() == nil {
+				continue
+			}
+			err = ctx.Err()
+		}
+		if err != nil && !errors.Is(err, context.Canceled) {
+			helper.log.WithLevel(zerolog.FatalLevel).Err(err).Msg("Fatal error syncing")
+			os.Exit(51)
+		} else {
+			helper.log.Info().Msg("Bridge bot to-device syncer stopped without error")
+		}
+		return
 	}
 }
 
@@ -557,9 +578,14 @@ func (helper *CryptoHelper) BeeperStreamPublisher() bridgev2.BeeperStreamPublish
 type cryptoSyncer struct {
 	*crypto.OlmMachine
 	handleSyncResponse func(context.Context, *mautrix.RespSync) []*event.Event
+
+	// consecutiveTimeouts counts timed-out /sync attempts since the last successful one (intbox, see
+	// crypto_syncrecovery.go). The sync token only moves on success, so these are all for the same token.
+	consecutiveTimeouts atomic.Int32
 }
 
 func (syncer *cryptoSyncer) ProcessResponse(ctx context.Context, resp *mautrix.RespSync, since string) error {
+	syncer.consecutiveTimeouts.Store(0)
 	done := make(chan struct{})
 	go func() {
 		defer func() {
@@ -591,8 +617,20 @@ func (syncer *cryptoSyncer) OnFailedSync(_ *mautrix.RespSync, err error) (time.D
 	if errors.Is(err, mautrix.MUnknownToken) {
 		return 0, err
 	}
-	syncer.Log.Error().Err(err).Msg("Error /syncing, waiting 10 seconds")
-	return 10 * time.Second, nil
+	timeouts := syncer.consecutiveTimeouts.Load()
+	if isSyncTimeout(err) {
+		timeouts = syncer.consecutiveTimeouts.Add(1)
+	}
+	if timeouts >= cryptoSyncStuckThreshold {
+		// intbox: the same request timed out repeatedly, retrying it again won't help (load-test P1).
+		// Returning an error ends SyncWithContext, and CryptoHelper.Start recovers with a narrowed sync.
+		syncer.consecutiveTimeouts.Store(0)
+		syncer.Log.Error().Err(err).Int32("consecutive_timeouts", timeouts).
+			Msg("Error /syncing, the same request timed out repeatedly")
+		return 0, fmt.Errorf("%w: %w", errCryptoSyncStuck, err)
+	}
+	syncer.Log.Error().Err(err).Int32("consecutive_timeouts", timeouts).Msg("Error /syncing, waiting 10 seconds")
+	return cryptoSyncRetryDelay, nil
 }
 
 func (syncer *cryptoSyncer) GetFilterJSON(_ id.UserID) *mautrix.Filter {

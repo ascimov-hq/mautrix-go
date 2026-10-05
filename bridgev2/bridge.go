@@ -46,7 +46,7 @@ type Bridge struct {
 	userLoginsByID map[networkid.UserLoginID]*UserLogin
 	portalsByKey   map[networkid.PortalKey]*Portal
 	portalsByMXID  map[id.RoomID]*Portal
-	ghostsByID     map[networkid.UserID]*Ghost
+	ghostsByID     *ghostCache
 	cacheLock      sync.Mutex
 
 	didSplitPortals bool
@@ -54,6 +54,12 @@ type Bridge struct {
 	Background          bool
 	ExternallyManagedDB bool
 	stopping            atomic.Bool
+
+	// intbox: startup window and shutdown drain, see lifecycle_intbox.go
+	connectorsStartedAt atomic.Int64 // unix nanos of the last StartConnectors, 0 if never started
+	loginsStartedAt     atomic.Int64 // unix nanos when StartLogins had started every login, 0 while starting
+	activePortalEvents  atomic.Int64 // portal events whose handler is running
+	matrixPortalEvents  atomic.Int64 // Matrix events queued in a portal or whose handler is running
 
 	wakeupBackfillQueue chan struct{}
 	stopBackfillQueue   *exsync.Event
@@ -85,7 +91,6 @@ func NewBridge(
 		userLoginsByID: make(map[networkid.UserLoginID]*UserLogin),
 		portalsByKey:   make(map[networkid.PortalKey]*Portal),
 		portalsByMXID:  make(map[id.RoomID]*Portal),
-		ghostsByID:     make(map[networkid.UserID]*Ghost),
 
 		wakeupBackfillQueue: make(chan struct{}),
 		manualBackfills:     make(chan *ManualBackfill, 64),
@@ -94,6 +99,7 @@ func NewBridge(
 	if br.Config == nil {
 		br.Config = &bridgeconfig.BridgeConfig{CommandPrefix: "!bridge"}
 	}
+	br.ghostsByID = newGhostCache(br.Config.GhostCacheSize, br.onGhostEvicted)
 	br.Commands = newCommandProcessor(br)
 	br.Matrix.Init(br)
 	br.Bot = br.Matrix.BotIntent()
@@ -178,6 +184,8 @@ func (br *Bridge) RunOnce(ctx context.Context, loginID networkid.UserLoginID, pa
 func (br *Bridge) StartConnectors(ctx context.Context) error {
 	br.Log.Info().Msg("Starting bridge")
 	br.stopping.Store(false)
+	br.loginsStartedAt.Store(0)
+	br.connectorsStartedAt.Store(time.Now().UnixNano())
 	if br.BackgroundCtx == nil || br.BackgroundCtx.Err() != nil {
 		br.BackgroundCtx, br.cancelBackgroundCtx = context.WithCancel(context.Background())
 		br.BackgroundCtx = br.Log.WithContext(br.BackgroundCtx)
@@ -382,6 +390,7 @@ func (br *Bridge) StartLogins(ctx context.Context) error {
 		go br.RunBackfillQueue()
 	}
 
+	br.loginsStartedAt.Store(time.Now().UnixNano())
 	br.Log.Info().Msg("Bridge started")
 	return nil
 }
@@ -440,6 +449,9 @@ func (br *Bridge) stop(isRunOnce bool, timeout time.Duration) {
 	br.DisappearLoop.Stop()
 	br.stopBackfillQueue.Set()
 	br.Matrix.PreStop()
+	// intbox: Matrix events whose appservice transaction was already answered are still queued in the appservice;
+	// let them reach their portals while the logins are still connected (load-test L6-2). See lifecycle_intbox.go.
+	br.drainMatrixEvents(min(ShutdownMatrixDrainTimeout, ShutdownDrainTimeout))
 	if !isRunOnce {
 		br.cacheLock.Lock()
 		var wg sync.WaitGroup
@@ -453,6 +465,9 @@ func (br *Bridge) stop(isRunOnce bool, timeout time.Duration) {
 		br.cacheLock.Unlock()
 		wg.Wait()
 	}
+	// intbox: let queued and running portal events finish (their Matrix sends and database writes) before the
+	// Matrix connector and the database go away. See lifecycle_intbox.go.
+	br.drainPortalEvents(ShutdownDrainTimeout)
 	br.Matrix.Stop()
 	if br.cancelBackgroundCtx != nil {
 		br.cancelBackgroundCtx()

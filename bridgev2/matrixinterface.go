@@ -192,6 +192,11 @@ func (ce CallbackError) Unwrap() error {
 
 type EnsureJoinedParams struct {
 	Via []string
+	// MemberEventExtra, if set, is called to get extra content for the member event when the user isn't
+	// joined yet. In that case the bridge bot invites the user and the user joins with a member state event
+	// that includes the returned fields (e.g. com.zeldin.bridge_ids), instead of trying a plain /join first.
+	// If the invite or join fails, the normal join flow is used as a fallback.
+	MemberEventExtra func(ctx context.Context) map[string]any
 }
 
 type MatrixAPI interface {

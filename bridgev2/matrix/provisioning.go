@@ -52,6 +52,11 @@ type ProvisioningAPI struct {
 
 	logins     map[string]*ProvLogin
 	loginsLock sync.RWMutex
+	// How long completed and superseded login processes are kept to answer repeated step requests.
+	// Zero means DefaultFinishedLoginRetention. Only changed by tests.
+	finishedLoginRetention time.Duration
+	// loginStartSeq numbers login start requests in the order they arrive (see ProvLogin.startSeq).
+	loginStartSeq atomic.Uint64
 
 	matrixAuthCache     map[string]matrixAuthCacheEntry
 	matrixAuthCacheLock sync.Mutex

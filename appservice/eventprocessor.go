@@ -10,12 +10,15 @@ import (
 	"context"
 	"encoding/json"
 	"runtime/debug"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
 
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 )
 
 type ExecMode uint8
@@ -24,7 +27,22 @@ const (
 	AsyncHandlers ExecMode = iota
 	AsyncLoop
 	Sync
+	// SyncPerRoom (intbox) handles the events of one room one at a time, in the order they arrived, like Sync, but
+	// different rooms in parallel. With Sync, one slow event (a portal busy with an import, a 3 s wait for a megolm
+	// key, a slow database) held up every room's events behind it: in load test L5 the app -> WhatsApp messages of
+	// users who weren't importing anything waited about 200 s behind other users' imports. AsyncHandlers has no such
+	// stall but gives up the order within a room (3 % of messages, more than half of the chats, in the same test).
+	// At most RoomQueueMaxPending events are queued or being handled across all rooms; beyond that, reading from
+	// the Events channel waits, so the homeserver is slowed down as with Sync.
+	SyncPerRoom
 )
+
+// DefaultRoomQueueMaxPending is the default for EventProcessor.RoomQueueMaxPending.
+var DefaultRoomQueueMaxPending = 4096
+
+type roomEventQueue struct {
+	events []*event.Event
+}
 
 type EventHandler = func(ctx context.Context, evt *event.Event)
 type OTKHandler = func(ctx context.Context, otk *mautrix.OTKCount)
@@ -35,6 +53,18 @@ type EventProcessor struct {
 
 	ExecSyncWarnTime time.Duration
 	ExecSyncTimeout  time.Duration
+
+	// RoomQueueMaxPending is how many events SyncPerRoom holds at most, queued or being handled, across all rooms
+	// (0 means DefaultRoomQueueMaxPending). It's read once, in Start.
+	RoomQueueMaxPending int
+
+	roomLock   sync.Mutex
+	roomQueues map[id.RoomID]*roomEventQueue
+	roomSlots  chan struct{}
+
+	// inHand (intbox) counts events taken from the Events channel by the event loop that are neither in a room
+	// queue nor handled yet: the event Sync/AsyncLoop is dispatching, or the one SyncPerRoom waits a slot for.
+	inHand atomic.Int64
 
 	as       *AppService
 	stop     chan struct{}
@@ -141,7 +171,7 @@ func (ep *EventProcessor) Dispatch(ctx context.Context, evt *event.Event) {
 				ep.callHandler(ctx, handler, evt)
 			}
 		}()
-	case Sync:
+	case Sync, SyncPerRoom:
 		if ep.ExecSyncWarnTime == 0 && ep.ExecSyncTimeout == 0 {
 			for _, handler := range handlers {
 				ep.callHandler(ctx, handler, evt)
@@ -174,10 +204,16 @@ func (ep *EventProcessor) Dispatch(ctx context.Context, evt *event.Event) {
 	}
 }
 func (ep *EventProcessor) startEvents(ctx context.Context) {
+	if ep.ExecMode == SyncPerRoom {
+		ep.startEventsPerRoom(ctx)
+		return
+	}
 	for {
 		select {
 		case evt := <-ep.as.Events:
+			ep.inHand.Add(1)
 			ep.Dispatch(ctx, evt)
+			ep.inHand.Add(-1)
 		case <-ep.stop:
 			return
 		}
@@ -199,7 +235,107 @@ func (ep *EventProcessor) startEncryption(ctx context.Context) {
 	}
 }
 
+// startEventsPerRoom is the SyncPerRoom loop: it moves each event from the Events channel to its room's queue as
+// soon as a slot is free, and every room with queued events has one goroutine that handles them in order.
+func (ep *EventProcessor) startEventsPerRoom(ctx context.Context) {
+	var lastFullWarning time.Time
+	for {
+		select {
+		case evt := <-ep.as.Events:
+			ep.inHand.Add(1)
+			select {
+			case ep.roomSlots <- struct{}{}:
+			default:
+				if time.Since(lastFullWarning) >= 10*time.Second {
+					lastFullWarning = time.Now()
+					ep.as.Log.Warn().
+						Int("max_pending", cap(ep.roomSlots)).
+						Str("event_id", evt.ID.String()).
+						Str("room_id", evt.RoomID.String()).
+						Msg("Per-room event queues are full, waiting for a free slot")
+				}
+				select {
+				case ep.roomSlots <- struct{}{}:
+				case <-ep.stop:
+					ep.inHand.Add(-1)
+					return
+				}
+			}
+			ep.queueRoomEvent(ctx, evt)
+			ep.inHand.Add(-1)
+		case <-ep.stop:
+			return
+		}
+	}
+}
+
+func (ep *EventProcessor) queueRoomEvent(ctx context.Context, evt *event.Event) {
+	ep.roomLock.Lock()
+	queue, running := ep.roomQueues[evt.RoomID]
+	if !running {
+		queue = &roomEventQueue{}
+		ep.roomQueues[evt.RoomID] = queue
+	}
+	queue.events = append(queue.events, evt)
+	ep.roomLock.Unlock()
+	if !running {
+		go ep.runRoomQueue(ctx, evt.RoomID, queue)
+	}
+}
+
+// runRoomQueue handles the room's events one at a time and exits when the queue is empty. queueRoomEvent starts a
+// new one for the next event, so there is at most one per room at any time.
+func (ep *EventProcessor) runRoomQueue(ctx context.Context, roomID id.RoomID, queue *roomEventQueue) {
+	for {
+		ep.roomLock.Lock()
+		if len(queue.events) == 0 {
+			delete(ep.roomQueues, roomID)
+			ep.roomLock.Unlock()
+			return
+		}
+		evt := queue.events[0]
+		queue.events[0] = nil
+		queue.events = queue.events[1:]
+		ep.roomLock.Unlock()
+		ep.Dispatch(ctx, evt)
+		<-ep.roomSlots
+	}
+}
+
+// PendingRoomEvents returns how many events SyncPerRoom holds (queued or being handled) and in how many rooms.
+// It is (0, 0) in the other modes.
+func (ep *EventProcessor) PendingRoomEvents() (events, rooms int) {
+	ep.roomLock.Lock()
+	defer ep.roomLock.Unlock()
+	return len(ep.roomSlots), len(ep.roomQueues)
+}
+
+// PendingEvents (intbox) returns how many Matrix events the appservice has accepted (the homeserver got its
+// transaction response) that haven't been handled yet: waiting in the Events channel, taken by the event loop, or
+// queued or being handled by SyncPerRoom. A bridge stop waits for it to reach 0 before disconnecting, so that these
+// events aren't dropped (load-test L6-2). Handlers that AsyncHandlers/AsyncLoop started in the background and
+// to-device events aren't counted.
+func (ep *EventProcessor) PendingEvents() int {
+	pending := len(ep.as.Events) + int(ep.inHand.Load())
+	ep.roomLock.Lock()
+	if ep.roomSlots != nil {
+		pending += len(ep.roomSlots)
+	}
+	ep.roomLock.Unlock()
+	return pending
+}
+
 func (ep *EventProcessor) Start(ctx context.Context) {
+	if ep.ExecMode == SyncPerRoom {
+		maxPending := ep.RoomQueueMaxPending
+		if maxPending <= 0 {
+			maxPending = DefaultRoomQueueMaxPending
+		}
+		ep.roomLock.Lock()
+		ep.roomQueues = make(map[id.RoomID]*roomEventQueue)
+		ep.roomSlots = make(chan struct{}, maxPending)
+		ep.roomLock.Unlock()
+	}
 	go ep.startEvents(ctx)
 	go ep.startEncryption(ctx)
 }
