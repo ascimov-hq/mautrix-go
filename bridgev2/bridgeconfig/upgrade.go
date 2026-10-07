@@ -45,6 +45,9 @@ func doUpgrade(helper up.Helper) {
 	helper.Copy(up.Bool, "bridge", "kick_matrix_users")
 	helper.Copy(up.Bool, "bridge", "enable_send_state_requests")
 	helper.Copy(up.Bool, "bridge", "phone_numbers_in_profile")
+	helper.Copy(up.Int, "bridge", "ghost_cache_size")
+	helper.Copy(up.Bool, "bridge", "lazy_join_with_invite")
+	helper.Copy(up.Bool, "bridge", "ignore_ephemeral_from_non_members")
 	helper.Copy(up.Bool, "bridge", "cleanup_on_logout", "enabled")
 	helper.Copy(up.Str, "bridge", "cleanup_on_logout", "manual", "private")
 	helper.Copy(up.Str, "bridge", "cleanup_on_logout", "manual", "relayed")
@@ -88,6 +91,7 @@ func doUpgrade(helper up.Helper) {
 	helper.Copy(up.Bool, "homeserver", "websocket")
 	helper.Copy(up.Int, "homeserver", "ping_interval_seconds")
 	helper.Copy(up.Int, "homeserver", "retry_limit")
+	helper.Copy(up.Int, "homeserver", "max_connections_per_pool")
 
 	helper.Copy(up.Str|up.Null, "appservice", "address")
 	helper.Copy(up.Str|up.Null, "appservice", "public_address")
@@ -123,6 +127,7 @@ func doUpgrade(helper up.Helper) {
 	}
 	helper.Copy(up.Bool, "provisioning", "debug_endpoints")
 	helper.Copy(up.Bool, "provisioning", "enable_session_transfers")
+	helper.Copy(up.Bool, "provisioning", "supersede_logins")
 
 	helper.Copy(up.Bool, "direct_media", "enabled")
 	helper.Copy(up.Str|up.Null, "direct_media", "media_id_prefix")

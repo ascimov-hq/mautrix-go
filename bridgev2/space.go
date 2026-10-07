@@ -24,6 +24,7 @@ func (ul *UserLogin) MarkInPortal(ctx context.Context, portal *Portal) {
 	if ul.inPortalCache.Has(portal.PortalKey) {
 		return
 	}
+	ctx = WithIntboxLane(ctx, mautrix.IntboxLaneBulk, ul)
 	userPortal, err := ul.Bridge.DB.UserPortal.GetOrCreate(ctx, ul.UserLogin, portal.PortalKey)
 	if err != nil {
 		zerolog.Ctx(ctx).Err(err).Msg("Failed to ensure user portal row exists")
@@ -57,6 +58,7 @@ func (ul *UserLogin) tryAddPortalToSpace(ctx context.Context, portal *Portal, us
 }
 
 func (ul *UserLogin) AddPortalToSpace(ctx context.Context, portal *Portal, userPortal *database.UserPortal) error {
+	ctx = WithIntboxLane(ctx, mautrix.IntboxLaneBulk, ul)
 	if portal.MXID == "" || portal.Parent != nil {
 		return nil
 	}
@@ -105,6 +107,7 @@ func (portal *Portal) addToParentSpaceAndSave(ctx context.Context, save bool) {
 }
 
 func (portal *Portal) toggleSpace(ctx context.Context, spaceID id.RoomID, canonical, remove bool) error {
+	ctx = WithIntboxLane(ctx, mautrix.IntboxLaneBulk, nil)
 	via := []string{portal.Bridge.Matrix.ServerName()}
 	if remove {
 		via = nil
@@ -132,6 +135,7 @@ func (portal *Portal) toggleSpace(ctx context.Context, spaceID id.RoomID, canoni
 }
 
 func (ul *UserLogin) GetSpaceRoom(ctx context.Context) (id.RoomID, error) {
+	ctx = WithIntboxLane(ctx, mautrix.IntboxLaneBulk, ul)
 	if !ul.Bridge.Config.PersonalFilteringSpaces {
 		return ul.SpaceRoom, nil
 	}

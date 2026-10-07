@@ -452,6 +452,9 @@ type ReqBeeperBatchSend struct {
 	SendNotification    bool           `json:"send_notification"`
 	MarkReadBy          id.UserID      `json:"mark_read_by,omitempty"`
 	Events              []*event.Event `json:"events"`
+	// TxnID is an optional idempotency key. Homeservers that support it return the response of the
+	// original request if a request with the same transaction ID is retried, instead of sending the events again.
+	TxnID string `json:"txn_id,omitempty"`
 }
 
 type ReqSetReadMarkers struct {

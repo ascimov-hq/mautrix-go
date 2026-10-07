@@ -145,7 +145,14 @@ func (br *Connector) waitLongerForSession(ctx context.Context, evt *event.Event,
 	go br.sendCryptoStatusError(ctx, evt, fmt.Errorf("%w. The bridge will retry for %d seconds", errNoDecryptionKeys, int(extendedSessionWaitTimeout.Seconds())), errorEventID, 1, false)
 
 	if !br.Crypto.WaitForSession(ctx, evt.RoomID, content.SenderKey, content.SessionID, extendedSessionWaitTimeout) {
-		log.Debug().Msg("Didn't get session, giving up trying to decrypt event")
+		// intbox: warn instead of debug. The message is dropped here (FAIL_RETRIABLE status to the sender), and
+		// at debug level nothing showed it in production logs (load-test U5).
+		log.Warn().
+			Stringer("room_id", evt.RoomID).
+			Stringer("sender", evt.Sender).
+			Str("sender_device_id", string(content.DeviceID)).
+			Dur("waited", time.Since(decryptionStart)).
+			Msg("Didn't get session, giving up trying to decrypt event")
 		go br.sendCryptoStatusError(ctx, evt, errNoDecryptionKeys, errorEventID, 2, true)
 		return
 	}
@@ -186,6 +193,21 @@ func (br *Connector) sendBridgeCheckpoint(ctx context.Context, evt *event.Event)
 	if !evt.Mautrix.CheckpointSent {
 		go br.sendSuccessCheckpoint(ctx, evt, status.MsgStepBridge, 0)
 	}
+}
+
+// shouldQueueAppserviceEvent is [appservice.AppService.ShouldQueueEvent]: it drops the echoes of the bridge's own
+// timeline (non-state) events before they take a slot in the appservice event channel. These are exactly the
+// events that handleRoomEvent and handleEncryptedEvent drop at once through shouldIgnoreEvent (sent by the bot or
+// a ghost, or a double puppet echo), so no handler sees a difference. During an import they are most of the
+// transaction traffic (about 1M echoes in the load-test seed), and with synchronous handling every echo used to
+// wait for its slot in front of the users' own events (load-test P2).
+// State events (the state store and membership handling need them) and ephemeral events (filtered per user in
+// handleEphemeralEvent) are always queued.
+func (br *Connector) shouldQueueAppserviceEvent(evt *event.Event) bool {
+	if evt.Type.Class != event.MessageEventType || evt.StateKey != nil {
+		return true
+	}
+	return !br.shouldIgnoreEvent(evt)
 }
 
 func (br *Connector) shouldIgnoreEventFromUser(userID id.UserID) bool {

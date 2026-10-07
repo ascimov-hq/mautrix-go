@@ -109,6 +109,23 @@ paths:
              (from either step 1 or step 2) if the user wants to try again.
            * If step type `complete` is returned, the login finished successfully.
            * Otherwise, go to step 3 with the new data.
+
+        Retries and replaced processes:
+        * After a process completes, every step request for it returns the same `complete` step
+          (HTTP 200) for 5 minutes, so a client that lost the response can simply retry.
+        * A process that failed with an error is forgotten immediately (later requests get 404).
+          A request that arrived while another step of the same process was running waits for it
+          and gets the same result.
+        * If `provisioning.supersede_logins` is enabled (the default), starting a login process cancels
+          the user's older unfinished processes, unless the network reports them as already completing.
+          Step requests for a cancelled process return HTTP 410 `FI.MAU.BRIDGE.LOGIN_SUPERSEDED` for
+          5 minutes, then 404. Network connectors may also return 410 when a newer login for the same
+          remote account replaced the process.
+        * "Newer" means the start request that arrived last. Starting can take a while (e.g. connecting to
+          the remote network), so when two start requests of the same user overlap, this endpoint returns
+          HTTP 410 `FI.MAU.BRIDGE.LOGIN_SUPERSEDED` (and no login ID) to the one that arrived first if the
+          other one's process already exists. Clients that only use the response of their latest start
+          request don't need to handle this specially.
       operationId: startLogin
       parameters:
       - name: login_id
@@ -135,6 +152,8 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         404:
           $ref: '#/components/responses/LoginNotFound'
+        410:
+          $ref: '#/components/responses/LoginSuperseded'
         500:
           $ref: '#/components/responses/InternalError'
       security:
@@ -164,6 +183,10 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         404:
           $ref: '#/components/responses/LoginProcessNotFound'
+        409:
+          $ref: '#/components/responses/LoginStepMismatch'
+        410:
+          $ref: '#/components/responses/LoginSuperseded'
         500:
           $ref: '#/components/responses/InternalError'
       security:
@@ -193,6 +216,10 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         404:
           $ref: '#/components/responses/LoginProcessNotFound'
+        409:
+          $ref: '#/components/responses/LoginStepMismatch'
+        410:
+          $ref: '#/components/responses/LoginSuperseded'
         500:
           $ref: '#/components/responses/InternalError'
       security:
@@ -214,6 +241,10 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         404:
           $ref: '#/components/responses/LoginProcessNotFound'
+        409:
+          $ref: '#/components/responses/LoginStepMismatch'
+        410:
+          $ref: '#/components/responses/LoginSuperseded'
         500:
           $ref: '#/components/responses/InternalError'
       security:
@@ -222,20 +253,21 @@ paths:
     post:
       tags: [ auth ]
       summary: Cancel an ongoing login process.
+      description: |
+        Cancelling is idempotent: cancelling an unknown, already cancelled, completed or superseded
+        login process also returns 200 and doesn't change anything.
       operationId: cancelLogin
       parameters:
       - $ref: '#/components/parameters/loginProcessID'
       responses:
         200:
-          description: Login successfully cancelled
+          description: Login successfully cancelled, or there was nothing to cancel
           application/json:
             schema:
               type: object
               description: Empty object
         401:
           $ref: '#/components/responses/Unauthorized'
-        404:
-          $ref: '#/components/responses/LoginProcessNotFound'
       security:
       - matrix_auth: [ ]
   /v3/logout/{loginID}:
@@ -459,14 +491,13 @@ components:
             properties:
               errcode:
                 type: string
-                enum: [ M_NOT_JSON, M_BAD_STATE ]
+                enum: [ M_NOT_JSON ]
                 description: A Matrix-like error code
               error:
                 type: string
                 description: A human-readable error message
                 examples:
                 - Failed to decode request body
-                - Step type does not match
     Unauthorized:
       description: The request contained an invalid token
       content:
@@ -520,6 +551,43 @@ components:
                 description: A human-readable error message
                 examples:
                 - Login not found
+    LoginStepMismatch:
+      description: The step ID or step type in the request doesn't match the current step of the login process
+      content:
+        application/json:
+          schema:
+            type: object
+            description: A Matrix-like error response
+            properties:
+              errcode:
+                type: string
+                enum: [ M_BAD_STATE ]
+                description: A Matrix-like error code
+              error:
+                type: string
+                description: A human-readable error message
+                examples:
+                - Step ID does not match
+                - Step type does not match
+    LoginSuperseded:
+      description: |
+        The login process was cancelled because a newer login process was started for the same user
+        (or, if the network connector reports it, for the same remote account).
+      content:
+        application/json:
+          schema:
+            type: object
+            description: A Matrix-like error response
+            properties:
+              errcode:
+                type: string
+                enum: [ FI.MAU.BRIDGE.LOGIN_SUPERSEDED ]
+                description: A Matrix-like error code
+              error:
+                type: string
+                description: A human-readable error message
+                examples:
+                - Login process was replaced by a newer login process
     LoginNotFound:
       description: When explicitly specifying an existing user login, the specified login ID is unknown
       content:

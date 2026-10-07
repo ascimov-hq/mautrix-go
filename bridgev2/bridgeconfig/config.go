@@ -87,6 +87,9 @@ type BridgeConfig struct {
 	KickMatrixUsers               bool               `yaml:"kick_matrix_users"`
 	EnableSendStateRequests       bool               `yaml:"enable_send_state_requests"`
 	PhoneNumbersInProfile         bool               `yaml:"phone_numbers_in_profile"`
+	GhostCacheSize                int                `yaml:"ghost_cache_size"`
+	LazyJoinWithInvite            bool               `yaml:"lazy_join_with_invite"`
+	IgnoreNonMemberEphemeral      bool               `yaml:"ignore_ephemeral_from_non_members"`
 	CleanupOnLogout               CleanupOnLogouts   `yaml:"cleanup_on_logout"`
 	Relay                         RelayConfig        `yaml:"relay"`
 	PortalCreateFilter            PortalCreateFilter `yaml:"portal_create_filter"`
@@ -114,6 +117,7 @@ type ProvisioningConfig struct {
 	SharedSecret           string `yaml:"shared_secret"`
 	DebugEndpoints         bool   `yaml:"debug_endpoints"`
 	EnableSessionTransfers bool   `yaml:"enable_session_transfers"`
+	SupersedeLogins        bool   `yaml:"supersede_logins"`
 }
 
 type DirectMediaConfig struct {

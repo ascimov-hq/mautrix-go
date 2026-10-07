@@ -59,6 +59,34 @@ type LoginProcessCookies interface {
 	SubmitCookies(ctx context.Context, cookies map[string]string) (*LoginStep, error)
 }
 
+// LoginProcessCompleting is an optional interface that login processes can implement to report that the
+// remote network already accepted the login and the process is only finishing up. For example, WhatsApp
+// returns true after the PairSuccess event, while it waits for the reconnect that follows pairing.
+//
+// The provisioning API never cancels a completing process to make room for a newer login process of the
+// same user (see the provisioning.supersede_logins config option), because cancelling it at that point
+// would leave a half-registered session on the remote network.
+//
+// IsCompleting is called from other goroutines than the one running the current login step,
+// so implementations must be safe for concurrent use.
+type LoginProcessCompleting interface {
+	IsCompleting() bool
+}
+
+// LoginProcessSuperseded is an optional interface that login processes can implement to report that the
+// network connector already cancelled them because a newer login replaced them (e.g. WhatsApp: a newer pairing
+// code was requested for the same phone number), even before a step of the process returned ErrLoginSuperseded.
+//
+// When two login processes of the same user overlap, the provisioning API keeps the one whose start request
+// arrived last. A process that reports IsSuperseded doesn't count as that newer process, so the provisioning
+// API doesn't cancel the other one, which is the one the network connector kept.
+//
+// IsSuperseded is called from other goroutines than the one running the current login step,
+// so implementations must be safe for concurrent use.
+type LoginProcessSuperseded interface {
+	IsSuperseded() bool
+}
+
 type LoginFlow struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`

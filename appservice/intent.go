@@ -74,7 +74,8 @@ func (intent *IntentAPI) EnsureRegistered(ctx context.Context) error {
 		return nil
 	}
 
-	err = intent.Register(ctx)
+	// Registrations are paced in the bulk lane even when they're triggered by a live event.
+	err = intent.Register(mautrix.WithIntboxLane(ctx, mautrix.IntboxLaneBulk))
 	if err != nil && !errors.Is(err, mautrix.MUserInUse) {
 		return fmt.Errorf("failed to ensure registered: %w", err)
 	}

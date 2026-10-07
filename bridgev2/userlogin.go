@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"runtime/debug"
 	"slices"
 	"sync"
 	"time"
@@ -204,6 +205,7 @@ func (user *User) NewLogin(ctx context.Context, data *database.UserLogin, params
 		return nil, fmt.Errorf("failed to check if login already exists: %w", err)
 	}
 	var doInsert bool
+	var oldClient NetworkAPI
 	if ul != nil && ul.UserMXID != user.MXID {
 		if params.DeleteOnConflict {
 			ul.Delete(ctx, status.BridgeState{StateEvent: status.StateLoggedOut, Reason: "LOGIN_OVERRIDDEN_ANOTHER_USER"}, DeleteOpts{
@@ -219,6 +221,8 @@ func (user *User) NewLogin(ctx context.Context, data *database.UserLogin, params
 		if params.DontReuseExisting {
 			return nil, fmt.Errorf("login already exists")
 		}
+		// The existing client is replaced by LoadUserLogin below and disconnected right after that.
+		oldClient = ul.Client
 		doInsert = false
 		ul.RemoteName = data.RemoteName
 		ul.RemoteProfile = ul.RemoteProfile.Merge(data.RemoteProfile)
@@ -234,16 +238,25 @@ func (user *User) NewLogin(ctx context.Context, data *database.UserLogin, params
 			Bridge:    user.Bridge,
 			User:      user,
 			Log:       user.Log.With().Str("login_id", string(data.ID)).Logger(),
+
+			// Same as loadUserLogin. Without it, MarkInPortal (called for every remote event) never hits the
+			// cache for a freshly paired login, and redoes the user_portal upsert and the
+			// EnsureJoined/EnsureInvited check on every event until the bridge restarts.
+			inPortalCache: exsync.NewSet[networkid.PortalKey](),
 		}
 		ul.BridgeState = user.Bridge.NewBridgeStateQueue(ul)
 	}
 	noCancelCtx := ul.Log.WithContext(user.Bridge.BackgroundCtx)
 	err = params.LoadUserLogin(noCancelCtx, ul)
+	if err == nil && ul.Client == nil {
+		ul.Log.Error().Msg("LoadUserLogin didn't fill Client in NewLogin")
+		err = fmt.Errorf("client not filled by LoadUserLogin")
+	}
+	if oldClient != nil {
+		ul.retireReplacedClient(oldClient)
+	}
 	if err != nil {
 		return nil, err
-	} else if ul.Client == nil {
-		ul.Log.Error().Msg("LoadUserLogin didn't fill Client in NewLogin")
-		return nil, fmt.Errorf("client not filled by LoadUserLogin")
 	}
 	if doInsert {
 		err = user.Bridge.DB.UserLogin.Insert(noCancelCtx, ul.UserLogin)
@@ -559,6 +572,53 @@ func (ul *UserLogin) disconnectInternal(timeout time.Duration) {
 			return
 		}
 	}
+}
+
+// replacedClientDisconnectWait is how long NewLogin waits for a replaced client to disconnect.
+// NewLogin holds the bridge-wide cache lock, so a hanging disconnect must not block it for long.
+var replacedClientDisconnectWait = 5 * time.Second
+
+// retireReplacedClient is called by NewLogin after LoadUserLogin when an existing login was reused,
+// e.g. because the user paired the same remote account again. It disconnects the previous client,
+// which would otherwise stay connected with its event handlers and loops still running against
+// this UserLogin. Ported from upstream mautrix-go 0748d1e ("disconnect old client when recreating
+// login"), but done after LoadUserLogin instead of before it, so a failing LoadUserLogin doesn't
+// leave the login without a connected client.
+func (ul *UserLogin) retireReplacedClient(oldClient NetworkAPI) {
+	if ul.Client == oldClient {
+		// LoadUserLogin failed before creating a new client (or deliberately kept the old one),
+		// so the old client is still the live one.
+		return
+	} else if ul.Client == nil {
+		// LoadUserLogin failed after clearing the client. NewLogin returns an error in this case,
+		// but don't leave a nil client in the cached UserLogin.
+		ul.Log.Warn().Msg("LoadUserLogin left no client, keeping the previous client")
+		ul.Client = oldClient
+		return
+	}
+	// An unknown error reconnect scheduled for the old client would call recreateClient and replace the new client.
+	ul.BridgeState.StopUnknownErrorReconnect()
+	ul.Log.Info().Msg("Disconnecting previous client of re-created login")
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer func() {
+			if err := recover(); err != nil {
+				ul.Log.Error().
+					Bytes(zerolog.ErrorStackFieldName, debug.Stack()).
+					Any(zerolog.ErrorFieldName, err).
+					Msg("Panic while disconnecting previous client")
+			}
+		}()
+		oldClient.Disconnect()
+	}()
+	select {
+	case <-done:
+	case <-time.After(replacedClientDisconnectWait):
+		ul.Log.Warn().Msg("Disconnecting previous client is taking long, continuing in the background")
+	}
+	// Re-arm UserLogin.Disconnect for the new client, like recreateClient does.
+	ul.disconnectOnce = sync.Once{}
 }
 
 func (ul *UserLogin) recreateClient(ctx context.Context) error {

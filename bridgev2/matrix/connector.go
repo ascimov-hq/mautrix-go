@@ -59,6 +59,24 @@ type Crypto interface {
 	BeeperStreamPublisher() bridgev2.BeeperStreamPublisher
 }
 
+// PerRoomEventDispatch (intbox) makes async_transactions: false keep the order of Matrix events per room instead
+// of globally: rooms are handled in parallel, so one slow room (an import, a missing megolm key) no longer holds up
+// every other user's messages (load test L5: about 200 s). Set MAUTRIX_PER_ROOM_DISPATCH=false for the upstream
+// single loop. It has no effect with async_transactions: true.
+var PerRoomEventDispatch = true
+
+// eventExecMode is the appservice event processor's mode for the async_transactions setting.
+func eventExecMode(asyncTransactions bool) appservice.ExecMode {
+	switch {
+	case asyncTransactions:
+		return appservice.AsyncHandlers
+	case PerRoomEventDispatch:
+		return appservice.SyncPerRoom
+	default:
+		return appservice.Sync
+	}
+}
+
 type Connector struct {
 	AS           *appservice.AppService
 	Bot          *appservice.IntentAPI
@@ -110,6 +128,7 @@ var (
 	_ bridgev2.MatrixConnectorWithNameDisambiguation     = (*Connector)(nil)
 	_ bridgev2.MatrixConnectorWithURLPreviews            = (*Connector)(nil)
 	_ bridgev2.MatrixConnectorWithAnalytics              = (*Connector)(nil)
+	_ bridgev2.MatrixConnectorWithGhostEviction          = (*Connector)(nil)
 )
 
 func NewConnector(cfg *bridgeconfig.Config) *Connector {
@@ -130,10 +149,9 @@ func (br *Connector) Init(bridge *bridgev2.Bridge) {
 	br.AS = br.Config.MakeAppService()
 	br.AS.Log = bridge.Log
 	br.AS.StateStore = br.StateStore
+	br.AS.ShouldQueueEvent = br.shouldQueueAppserviceEvent
 	br.EventProcessor = appservice.NewEventProcessor(br.AS)
-	if !br.Config.AppService.AsyncTransactions {
-		br.EventProcessor.ExecMode = appservice.Sync
-	}
+	br.EventProcessor.ExecMode = eventExecMode(br.Config.AppService.AsyncTransactions)
 	for evtType := range status.CheckpointTypes {
 		br.EventProcessor.On(evtType, br.sendBridgeCheckpoint)
 	}
@@ -328,6 +346,15 @@ func (br *Connector) PreStop() {
 	sendStopSignal(br.wsShortCircuitReconnectBackoff)
 }
 
+// PendingMatrixEvents (intbox) implements bridgev2.MatrixConnectorWithPendingEvents: the Matrix events whose
+// appservice transaction was already answered but that weren't handled yet. See bridgev2.ShutdownMatrixDrainTimeout.
+func (br *Connector) PendingMatrixEvents() int {
+	if br.EventProcessor == nil {
+		return 0
+	}
+	return br.EventProcessor.PendingEvents()
+}
+
 func (br *Connector) Stop() {
 	br.EventProcessor.Stop()
 	if br.Crypto != nil {
@@ -511,6 +538,11 @@ func (br *Connector) GhostIntent(userID networkid.UserID) bridgev2.MatrixAPI {
 		Matrix:    br.AS.Intent(br.FormatGhostMXID(userID)),
 		Connector: br,
 	}
+}
+
+// ForgetGhost drops the cached appservice intent and client of a ghost that was evicted from the bridge's ghost cache.
+func (br *Connector) ForgetGhost(userID networkid.UserID) {
+	br.AS.ForgetIntent(br.FormatGhostMXID(userID))
 }
 
 func (br *Connector) SendBridgeStatus(ctx context.Context, state *status.BridgeState) error {

@@ -8,8 +8,11 @@ package bridgev2
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/http"
 	"slices"
 	"time"
 
@@ -25,6 +28,7 @@ import (
 )
 
 func (portal *Portal) doForwardBackfill(ctx context.Context, source *UserLogin, lastMessage *database.Message, bundledData any) {
+	ctx = WithIntboxLane(ctx, mautrix.IntboxLaneBackfill, source)
 	log := zerolog.Ctx(ctx).With().Str("action", "forward backfill").Logger()
 	if !portal.forwardBackfillLock.TryLock() {
 		log.Warn().Msg("Another forward backfill is already running")
@@ -94,6 +98,7 @@ func (portal *Portal) doForwardBackfill(ctx context.Context, source *UserLogin, 
 var errNoMessagesLeftAfterCutoff = errors.New("no messages left to backfill after cutting off too new messages")
 
 func (portal *Portal) doBackwardsBackfill(ctx context.Context, source *UserLogin, task *database.BackfillTask, resp *FetchMessagesResponse) (bool, error) {
+	ctx = WithIntboxLane(ctx, mautrix.IntboxLaneBackfill, source)
 	log := zerolog.Ctx(ctx)
 	api, ok := source.Client.(BackfillingNetworkAPI)
 	if !ok {
@@ -224,6 +229,7 @@ func (portal *Portal) fetchThreadBackfill(ctx context.Context, source *UserLogin
 }
 
 func (portal *Portal) doThreadBackfill(ctx context.Context, source *UserLogin, threadID networkid.MessageID) error {
+	ctx = WithIntboxLane(ctx, mautrix.IntboxLaneBackfill, source)
 	log := zerolog.Ctx(ctx).With().
 		Str("subaction", "thread backfill").
 		Str("thread_id", string(threadID)).
@@ -346,7 +352,9 @@ func (portal *Portal) sendBackfill(
 		done()
 	}
 	zerolog.Ctx(ctx).Debug().Msg("Backfill finished")
-	if !canBatchSend && !inThread && portal.Bridge.Config.Backfill.Threads.MaxInitialMessages > 0 {
+	// Threads are backfilled after the main batch in both modes: batch send segments can't contain
+	// events that relate to each other, as the event IDs are only known after sending.
+	if !inThread && portal.Bridge.Config.Backfill.Threads.MaxInitialMessages > 0 {
 		for _, msg := range messages {
 			if msg.ShouldBackfillThread {
 				err = portal.doThreadBackfill(ctx, source, msg.ID)
@@ -361,6 +369,10 @@ func (portal *Portal) sendBackfill(
 	return nil
 }
 
+// maxBatchSendEvents is the maximum number of events sent in a single batch send request. The homeserver
+// holds the room lock while it handles the whole batch, so large batches would block live sends in the room.
+const maxBatchSendEvents = 200
+
 type compileBatchOutput struct {
 	PrevThreadEvents map[networkid.MessageID]id.EventID
 
@@ -370,6 +382,114 @@ type compileBatchOutput struct {
 	DBMessages  []*database.Message
 	DBReactions []*database.Reaction
 	Disappear   []*database.DisappearingMessage
+
+	// Reactions to the messages in this segment. They're compiled into the next segment,
+	// after the homeserver has returned the event IDs of the messages they target.
+	PendingReactions []*pendingBatchReactions
+
+	// Messages and threads in this segment, used to detect relations that point to events
+	// whose event IDs aren't known yet because the segment hasn't been sent.
+	unsentMessages map[networkid.MessageID]struct{}
+	unsentThreads  map[networkid.MessageID]struct{}
+	// Senders whose membership has already been ensured during this batch (shared by all segments).
+	joinedSenders map[id.UserID]struct{}
+}
+
+type pendingBatchReactions struct {
+	Message *BackfillMessage
+	PartIDs []networkid.PartID
+	PartMap map[networkid.PartID]*database.Message
+}
+
+func newCompileBatchOutput(capacity int, joinedSenders map[id.UserID]struct{}) *compileBatchOutput {
+	return &compileBatchOutput{
+		PrevThreadEvents: make(map[networkid.MessageID]id.EventID),
+		Events:           make([]*event.Event, 0, capacity),
+		Extras:           make([]*MatrixSendExtra, 0, capacity),
+		DBMessages:       make([]*database.Message, 0, capacity),
+		DBReactions:      make([]*database.Reaction, 0),
+		Disappear:        make([]*database.DisappearingMessage, 0),
+
+		unsentMessages: make(map[networkid.MessageID]struct{}),
+		unsentThreads:  make(map[networkid.MessageID]struct{}),
+		joinedSenders:  joinedSenders,
+	}
+}
+
+// dependsOnUnsentEvent returns true if the given message replies to or continues a thread with
+// a message in the current segment. Such messages must go into the next segment, because the
+// event IDs are assigned by the homeserver and are only known after the segment has been sent.
+func (out *compileBatchOutput) dependsOnUnsentEvent(msg *BackfillMessage) bool {
+	if len(out.Events) == 0 {
+		return false
+	}
+	if msg.ReplyTo != nil {
+		if _, ok := out.unsentMessages[msg.ReplyTo.MessageID]; ok {
+			return true
+		}
+	}
+	if msg.ThreadRoot != nil {
+		_, rootUnsent := out.unsentMessages[*msg.ThreadRoot]
+		_, threadUnsent := out.unsentThreads[*msg.ThreadRoot]
+		return rootUnsent || threadUnsent
+	}
+	return false
+}
+
+// applyEventIDs replaces the pre-generated event IDs of the segment with the event IDs returned by
+// the homeserver, which are what the events actually got in the room. The database rows share the
+// pointers in Extras, so they're updated too.
+func (out *compileBatchOutput) applyEventIDs(resp *mautrix.RespBeeperBatchSend) error {
+	if resp == nil || len(resp.EventIDs) != len(out.Events) || len(out.Extras) != len(out.Events) {
+		var gotIDs int
+		if resp != nil {
+			gotIDs = len(resp.EventIDs)
+		}
+		return fmt.Errorf("homeserver returned %d event IDs for %d events", gotIDs, len(out.Events))
+	}
+	replaced := make(map[id.EventID]id.EventID)
+	for i, extra := range out.Extras {
+		newID := resp.EventIDs[i]
+		oldID := out.Events[i].ID
+		if newID == "" {
+			return fmt.Errorf("homeserver returned empty event ID at index %d", i)
+		} else if newID == oldID {
+			continue
+		}
+		replaced[oldID] = newID
+		out.Events[i].ID = newID
+		if extra.MessageMeta != nil {
+			extra.MessageMeta.MXID = newID
+		}
+		if extra.ReactionMeta != nil {
+			extra.ReactionMeta.MXID = newID
+		}
+	}
+	for _, disappear := range out.Disappear {
+		if newID, ok := replaced[disappear.EventID]; ok {
+			disappear.EventID = newID
+		}
+	}
+	return nil
+}
+
+// ensureBatchSenderJoined makes sure that the sender of a batch send event is in the room before
+// the batch is sent, as the homeserver rejects events from users who aren't joined.
+func (portal *Portal) ensureBatchSenderJoined(ctx context.Context, intent MatrixAPI, out *compileBatchOutput) {
+	userID := intent.GetMXID()
+	if _, alreadyChecked := out.joinedSenders[userID]; alreadyChecked {
+		return
+	}
+	out.joinedSenders[userID] = struct{}{}
+	if userID == portal.Bridge.Bot.GetMXID() {
+		return
+	}
+	err := intent.EnsureJoined(ctx, portal.MXID)
+	if err != nil {
+		zerolog.Ctx(ctx).Err(err).
+			Stringer("user_id", userID).
+			Msg("Failed to ensure batch send event sender is joined to the room")
+	}
 }
 
 func (portal *Portal) compileBatchMessage(ctx context.Context, source *UserLogin, msg *BackfillMessage, out *compileBatchOutput, inThread bool) {
@@ -380,19 +500,26 @@ func (portal *Portal) compileBatchMessage(ctx context.Context, source *UserLogin
 	if !ok {
 		return
 	}
+	portal.ensureBatchSenderJoined(ctx, intent, out)
+	// Relation targets must be real events: messages that are being sent in the same batch are always
+	// in an earlier segment (see dependsOnUnsentEvent), so they're already in the database.
 	replyTo, threadRoot, prevThreadEvent := portal.getRelationMeta(
-		ctx, msg.ID, msg.ConvertedMessage, true,
+		ctx, msg.ID, msg.ConvertedMessage, false,
 	)
 	if threadRoot != nil && out.PrevThreadEvents[*msg.ThreadRoot] != "" {
 		prevThreadEvent.MXID = out.PrevThreadEvents[*msg.ThreadRoot]
 	}
+	out.unsentMessages[msg.ID] = struct{}{}
+	if msg.ThreadRoot != nil {
+		out.unsentThreads[*msg.ThreadRoot] = struct{}{}
+	}
 	var partIDs []networkid.PartID
 	partMap := make(map[networkid.PartID]*database.Message, len(msg.Parts))
-	var firstPart *database.Message
 	for i, part := range msg.Parts {
 		partIDs = append(partIDs, part.ID)
 		portal.applyRelationMeta(ctx, part.Content, replyTo, threadRoot, prevThreadEvent)
 		part.Content.BeeperDisappearingTimer = msg.Disappear.ToEventContent()
+		// This is only a placeholder, it's replaced with the event ID returned by the homeserver after sending.
 		evtID := portal.Bridge.Matrix.GenerateDeterministicEventID(portal.MXID, portal.PortalKey, msg.ID, part.ID)
 		dbMessage := &database.Message{
 			ID:               msg.ID,
@@ -423,9 +550,6 @@ func (portal *Portal) compileBatchMessage(ctx context.Context, source *UserLogin
 				Raw:    part.Extra,
 			},
 		})
-		if firstPart == nil {
-			firstPart = dbMessage
-		}
 		partMap[part.ID] = dbMessage
 		out.Extras = append(out.Extras, &MatrixSendExtra{MessageMeta: dbMessage, StreamOrder: msg.StreamOrder, PartIndex: i})
 		out.DBMessages = append(out.DBMessages, dbMessage)
@@ -446,6 +570,19 @@ func (portal *Portal) compileBatchMessage(ctx context.Context, source *UserLogin
 		}
 	}
 	slices.Sort(partIDs)
+	if len(msg.Reactions) > 0 && len(partIDs) > 0 {
+		out.PendingReactions = append(out.PendingReactions, &pendingBatchReactions{
+			Message: msg,
+			PartIDs: partIDs,
+			PartMap: partMap,
+		})
+	}
+}
+
+// compileBatchReactions compiles the reactions of a message that was sent in a previous segment.
+// The message parts in PartMap already have the event IDs returned by the homeserver.
+func (portal *Portal) compileBatchReactions(ctx context.Context, source *UserLogin, pending *pendingBatchReactions, out *compileBatchOutput) {
+	msg := pending.Message
 	for _, reaction := range msg.Reactions {
 		if reaction == nil {
 			continue
@@ -455,16 +592,20 @@ func (portal *Portal) compileBatchMessage(ctx context.Context, source *UserLogin
 			continue
 		}
 		if reaction.TargetPart == nil {
-			reaction.TargetPart = &partIDs[0]
+			reaction.TargetPart = &pending.PartIDs[0]
 		}
 		if reaction.Timestamp.IsZero() {
 			reaction.Timestamp = msg.Timestamp.Add(10 * time.Millisecond)
 		}
-		//lint:ignore SA4006 it's a todo
-		targetPart, ok := partMap[*reaction.TargetPart]
-		if !ok {
-			// TODO warning log and/or skip reaction?
+		targetPart, ok := pending.PartMap[*reaction.TargetPart]
+		if !ok || targetPart.HasFakeMXID() {
+			zerolog.Ctx(ctx).Debug().
+				Str("message_id", string(msg.ID)).
+				Str("target_part_id", string(*reaction.TargetPart)).
+				Msg("Skipping backfill reaction to message part that wasn't bridged")
+			continue
 		}
+		portal.ensureBatchSenderJoined(ctx, reactionIntent, out)
 		reactionMXID := portal.Bridge.Matrix.GenerateReactionEventID(portal.MXID, targetPart, reaction.Sender.Sender, reaction.EmojiID)
 		dbReaction := &database.Reaction{
 			Room:          portal.PortalKey,
@@ -487,7 +628,7 @@ func (portal *Portal) compileBatchMessage(ctx context.Context, source *UserLogin
 				Parsed: &event.ReactionEventContent{
 					RelatesTo: event.RelatesTo{
 						Type:    event.RelAnnotation,
-						EventID: portal.Bridge.Matrix.GenerateDeterministicEventID(portal.MXID, portal.PortalKey, msg.ID, *reaction.TargetPart),
+						EventID: targetPart.MXID,
 						Key:     variationselector.Add(reaction.Emoji),
 					},
 				},
@@ -497,62 +638,120 @@ func (portal *Portal) compileBatchMessage(ctx context.Context, source *UserLogin
 		out.DBReactions = append(out.DBReactions, dbReaction)
 		out.Extras = append(out.Extras, &MatrixSendExtra{ReactionMeta: dbReaction})
 	}
-	if firstPart != nil && !inThread && portal.Bridge.Config.Backfill.Threads.MaxInitialMessages > 0 && msg.ShouldBackfillThread {
-		portal.fetchThreadInsideBatch(ctx, source, firstPart, out)
-	}
 }
 
-func (portal *Portal) fetchThreadInsideBatch(ctx context.Context, source *UserLogin, dbMsg *database.Message, out *compileBatchOutput) {
-	log := zerolog.Ctx(ctx).With().
-		Str("subaction", "thread backfill in batch").
-		Str("thread_id", string(dbMsg.ID)).
-		Logger()
-	ctx = log.WithContext(ctx)
-	resp := portal.fetchThreadBackfill(ctx, source, dbMsg)
-	if resp != nil {
-		for _, msg := range resp.Messages {
-			portal.compileBatchMessage(ctx, source, msg, out, true)
+// batchSendTxnID returns a deterministic transaction ID for a batch send segment, so that a request that is
+// retried (e.g. after a timeout) is deduplicated by the homeserver instead of creating the events twice.
+func (portal *Portal) batchSendTxnID(out *compileBatchOutput) string {
+	hash := sha256.New()
+	hash.Write([]byte(portal.MXID))
+	for _, extra := range out.Extras {
+		if extra.MessageMeta != nil {
+			_, _ = fmt.Fprintf(hash, "\x00m\x00%s\x00%s", extra.MessageMeta.ID, extra.MessageMeta.PartID)
+		} else if extra.ReactionMeta != nil {
+			_, _ = fmt.Fprintf(
+				hash, "\x00r\x00%s\x00%s\x00%s\x00%s",
+				extra.ReactionMeta.MessageID, extra.ReactionMeta.MessagePartID, extra.ReactionMeta.SenderID, extra.ReactionMeta.EmojiID,
+			)
 		}
 	}
+	return "mautrix-batch-" + base64.RawURLEncoding.EncodeToString(hash.Sum(nil)[:18])
 }
 
+// sendBatch sends backfill messages using the batch send API.
+//
+// The homeserver assigns the event IDs of batch sent events itself and returns them in the response,
+// so the messages are split into segments: a message that replies to or continues a thread with
+// a message in the current segment starts a new segment, and reactions are sent in the segment after
+// the messages they target. Segments are also capped at maxBatchSendEvents events.
 func (portal *Portal) sendBatch(ctx context.Context, source *UserLogin, messages []*BackfillMessage, forceForward, markRead, inThread bool) error {
-	out := &compileBatchOutput{
-		PrevThreadEvents: make(map[networkid.MessageID]id.EventID),
-		Events:           make([]*event.Event, 0, len(messages)),
-		Extras:           make([]*MatrixSendExtra, 0, len(messages)),
-		DBMessages:       make([]*database.Message, 0, len(messages)),
-		DBReactions:      make([]*database.Reaction, 0),
-		Disappear:        make([]*database.DisappearingMessage, 0),
+	// Every segment is part of the same backfill, so they all get the same notification flag
+	// (like the single batch did before segmenting). Only the last segment marks the room as read.
+	sendNotification := !markRead && forceForward && !inThread
+	joinedSenders := make(map[id.UserID]struct{})
+	out := newCompileBatchOutput(min(len(messages), maxBatchSendEvents), joinedSenders)
+	nextSegment := func() error {
+		err := portal.sendBatchSegment(ctx, source, out, forceForward, false, sendNotification)
+		if err != nil {
+			return err
+		}
+		pendingReactions := out.PendingReactions
+		out = newCompileBatchOutput(min(len(messages), maxBatchSendEvents), joinedSenders)
+		for _, pending := range pendingReactions {
+			portal.compileBatchReactions(ctx, source, pending, out)
+		}
+		// The new segment only contains reactions at this point (one event, extra and database row each),
+		// and a segment's worth of messages can have more reactions than fit in a single request.
+		for len(out.Events) > maxBatchSendEvents {
+			reactionsOnly := newCompileBatchOutput(0, joinedSenders)
+			reactionsOnly.Events, out.Events = out.Events[:maxBatchSendEvents], out.Events[maxBatchSendEvents:]
+			reactionsOnly.Extras, out.Extras = out.Extras[:maxBatchSendEvents], out.Extras[maxBatchSendEvents:]
+			reactionsOnly.DBReactions, out.DBReactions = out.DBReactions[:maxBatchSendEvents], out.DBReactions[maxBatchSendEvents:]
+			err = portal.sendBatchSegment(ctx, source, reactionsOnly, forceForward, false, sendNotification)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	for _, msg := range messages {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if len(out.Events) > 0 && (len(out.Events)+len(msg.Parts) > maxBatchSendEvents || out.dependsOnUnsentEvent(msg)) {
+			if err := nextSegment(); err != nil {
+				return err
+			}
+		}
 		portal.compileBatchMessage(ctx, source, msg, out, inThread)
 	}
-	req := &mautrix.ReqBeeperBatchSend{
-		ForwardIfNoMessages: !forceForward,
-		Forward:             forceForward,
-		SendNotification:    !markRead && forceForward && !inThread,
-		Events:              out.Events,
+	if len(out.PendingReactions) > 0 {
+		if err := nextSegment(); err != nil {
+			return err
+		}
 	}
-	if markRead {
-		req.MarkReadBy = source.UserMXID
-	}
-	_, err := portal.Bridge.Matrix.BatchSend(ctx, portal.MXID, req, out.Extras)
-	if err != nil {
-		zerolog.Ctx(ctx).Err(err).Msg("Failed to send backfill messages")
-		return err
+	return portal.sendBatchSegment(ctx, source, out, forceForward, markRead, sendNotification)
+}
+
+func (portal *Portal) sendBatchSegment(ctx context.Context, source *UserLogin, out *compileBatchOutput, forceForward, markRead, sendNotification bool) error {
+	if len(out.Events) > 0 {
+		req := &mautrix.ReqBeeperBatchSend{
+			ForwardIfNoMessages: !forceForward,
+			Forward:             forceForward,
+			SendNotification:    sendNotification,
+			Events:              out.Events,
+			TxnID:               portal.batchSendTxnID(out),
+		}
+		if markRead {
+			req.MarkReadBy = source.UserMXID
+		}
+		zerolog.Ctx(ctx).Debug().
+			Int("event_count", len(out.Events)).
+			Str("txn_id", req.TxnID).
+			Msg("Sending batch of backfill events")
+		resp, err := portal.Bridge.Matrix.BatchSend(ctx, portal.MXID, req, out.Extras)
+		if err != nil {
+			zerolog.Ctx(ctx).Err(err).Msg("Failed to send backfill messages")
+			return err
+		}
+		err = out.applyEventIDs(resp)
+		if err != nil {
+			zerolog.Ctx(ctx).Err(err).Msg("Failed to apply event IDs of batch sent backfill messages")
+			return err
+		}
 	}
 	if len(out.Disappear) > 0 {
+		disappear := out.Disappear
 		// TODO mass insert disappearing messages
 		go func() {
-			for _, msg := range out.Disappear {
+			for _, msg := range disappear {
 				portal.Bridge.DisappearLoop.Add(ctx, msg)
 			}
 		}()
 	}
 	// TODO mass insert db messages
 	for _, msg := range out.DBMessages {
-		err = portal.Bridge.DB.Message.Insert(ctx, msg)
+		err := portal.Bridge.DB.Message.Insert(ctx, msg)
 		if err != nil {
 			zerolog.Ctx(ctx).Err(err).
 				Str("message_id", string(msg.ID)).
@@ -565,7 +764,7 @@ func (portal *Portal) sendBatch(ctx context.Context, source *UserLogin, messages
 	}
 	// TODO mass insert db reactions
 	for _, react := range out.DBReactions {
-		err = portal.Bridge.DB.Reaction.Upsert(ctx, react)
+		err := portal.Bridge.DB.Reaction.Upsert(ctx, react)
 		if err != nil {
 			zerolog.Ctx(ctx).Err(err).
 				Str("message_id", string(react.MessageID)).
@@ -579,8 +778,54 @@ func (portal *Portal) sendBatch(ctx context.Context, source *UserLogin, messages
 	return nil
 }
 
+// isSkippableBackfillError returns true if a backfill message failed in a way that won't be fixed by retrying,
+// like the homeserver rejecting the event (e.g. 403 for power levels or 413 for oversized events) or the message
+// row failing to insert. Such messages are skipped so that one bad message doesn't stop the rest of the chat's
+// history from being backfilled. Other errors (network errors, server errors, rate limits) still abort the batch,
+// so that the backfill isn't marked as complete while the server is unavailable. 401 (bad appservice token)
+// and 408 (request timeout) are 4xx errors that affect every message, so they also abort the batch.
+func isSkippableBackfillError(err error) bool {
+	switch typedErr := err.(type) {
+	case nil:
+		return false
+	case mautrix.HTTPError:
+		if typedErr.Response == nil {
+			return false
+		}
+		switch statusCode := typedErr.Response.StatusCode; statusCode {
+		case http.StatusUnauthorized, http.StatusRequestTimeout, http.StatusTooManyRequests:
+			return false
+		default:
+			return statusCode >= 400 && statusCode < 500
+		}
+	case interface{ Unwrap() []error }:
+		errs := typedErr.Unwrap()
+		if len(errs) == 0 {
+			return false
+		}
+		if _, isStatus := errs[0].(MessageStatus); isStatus && errors.Is(errs[0], ErrDatabaseError) {
+			// fmt.Errorf("%w: ...: %w", ErrDatabaseError, err): failing to save a message part that was already sent to Matrix.
+			// This only matches the database error wrapper itself, not an errors.Join that also contains other errors.
+			return true
+		}
+		// Multiple failed parts (errors.Join): only skip if all of them are skippable
+		for _, wrappedErr := range errs {
+			if !isSkippableBackfillError(wrappedErr) {
+				return false
+			}
+		}
+		return true
+	case interface{ Unwrap() error }:
+		return isSkippableBackfillError(typedErr.Unwrap())
+	default:
+		return false
+	}
+}
+
 func (portal *Portal) sendLegacyBackfill(ctx context.Context, source *UserLogin, messages []*BackfillMessage, markRead bool) error {
 	var lastPart id.EventID
+	var skippedMessages int
+	var lastSkipErr error
 	for _, msg := range messages {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -596,7 +841,19 @@ func (portal *Portal) sendLegacyBackfill(ctx context.Context, source *UserLogin,
 				Time("message_ts", msg.Timestamp)
 		})
 		if !res.Success {
-			return res.Error
+			if ctx.Err() != nil {
+				return ctx.Err()
+			} else if !isSkippableBackfillError(res.Error) {
+				return res.Error
+			}
+			skippedMessages++
+			lastSkipErr = res.Error
+			zerolog.Ctx(ctx).Warn().Err(res.Error).
+				Str("message_id", string(msg.ID)).
+				Any("sender_id", msg.Sender).
+				Time("message_ts", msg.Timestamp).
+				Int("sent_parts", len(dbMessages)).
+				Msg("Failed to send backfill message, skipping it and continuing with the rest of the batch")
 		}
 		if len(dbMessages) > 0 {
 			lastPart = dbMessages[len(dbMessages)-1].MXID
@@ -633,7 +890,18 @@ func (portal *Portal) sendLegacyBackfill(ctx context.Context, source *UserLogin,
 			}
 		}
 	}
-	if markRead {
+	if skippedMessages > 0 && lastPart == "" {
+		// Nothing reached Matrix, so the errors are most likely not specific to the skipped messages
+		// (e.g. the bridge lost permissions in the room). Fail the batch like before instead of completing it,
+		// so that the network connector doesn't throw away the history.
+		return fmt.Errorf("all %d backfill messages that were tried failed to send: %w", skippedMessages, lastSkipErr)
+	} else if skippedMessages > 0 {
+		zerolog.Ctx(ctx).Warn().
+			Int("skipped_count", skippedMessages).
+			Int("total_count", len(messages)).
+			Msg("Some backfill messages were skipped because they failed to send")
+	}
+	if markRead && lastPart != "" {
 		dp := source.User.DoublePuppet(ctx)
 		if dp != nil {
 			err := dp.MarkRead(ctx, portal.MXID, lastPart, time.Now())

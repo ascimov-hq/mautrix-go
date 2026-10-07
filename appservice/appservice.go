@@ -30,17 +30,21 @@ import (
 )
 
 // EventChannelSize is the size for the Events channel in Appservice instances.
-var EventChannelSize = 64
+//
+// intbox: 1024 instead of upstream's 64. With synchronous event handling (async_transactions: false) a transaction
+// response waits until its last event is in this channel, so a full channel holds up the homeserver's appservice
+// sender, which times out after about 35 s and resends the whole transaction. 64 slots filled up under 40 active
+// devices' read receipts and during imports ("Event channel is full", load-test U6 and P2). An event is a few KB,
+// so 1024 queued events are a few MB at most.
+var EventChannelSize = 1024
 var OTKChannelSize = 64
 
 // Create creates a blank appservice instance.
 func Create() *AppService {
-	jar, _ := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
 	as := &AppService{
 		Log:        zerolog.Nop(),
 		clients:    make(map[id.UserID]*mautrix.Client),
 		intents:    make(map[id.UserID]*IntentAPI),
-		HTTPClient: &http.Client{Timeout: 180 * time.Second, Jar: jar},
 		StateStore: mautrix.NewMemoryStateStore().(StateStore),
 		Router:     http.NewServeMux(),
 		UserAgent:  mautrix.DefaultUserAgent,
@@ -58,7 +62,10 @@ func Create() *AppService {
 		SpecVersions: &mautrix.RespVersions{},
 
 		DefaultHTTPRetries: 4,
+
+		HomeserverMaxConnsPerPool: mautrix.DefaultIntboxMaxConnsPerPool,
 	}
+	as.HTTPClient = as.newHomeserverHTTPClient(nil)
 
 	as.Router.HandleFunc("PUT /_matrix/app/v1/transactions/{txnID}", as.PutTransaction)
 	as.Router.HandleFunc("GET /_matrix/app/v1/rooms/{roomAlias}", as.GetRoom)
@@ -168,6 +175,26 @@ type AppService struct {
 	SpecVersions *mautrix.RespVersions
 
 	DefaultHTTPRetries int
+	// HomeserverMaxConnsPerPool caps the concurrent connections to each homeserver host, per connection pool of
+	// [mautrix.IntboxLaneTransport] (live, bulk writes, backfill writes, background reads and registrations; the
+	// pool follows the request's lane, see [mautrix.IntboxLane]). Requests that the reverse proxy delays in the bulk
+	// or backfill lane never hold up live or encryption requests, and requests over the cap wait in the bridge
+	// instead of opening more sockets.
+	// 0 disables this: [AppService.HTTPClient] then uses Go's default transport (no cap, one shared pool).
+	// It is applied when the HTTP client is created, so set it before calling [AppService.SetHomeserverURL].
+	// Create sets it to [mautrix.DefaultIntboxMaxConnsPerPool].
+	HomeserverMaxConnsPerPool int
+
+	// externalClient is the HTTP client for other homeservers (see externalHTTPClient), created on first use.
+	externalClient         *http.Client
+	externalHTTPClientLock sync.Mutex
+
+	// ShouldQueueEvent, if set, is called for every timeline and ephemeral event of a transaction after the state
+	// store has been updated and before the event is put into [AppService.Events]. Returning false drops the event.
+	// Bridges use it to drop the echoes of their own events (sent by the bot or a ghost), which every handler
+	// ignores anyway, so they no longer take slots in the channel ahead of real users' events.
+	// To-device events are never passed to it.
+	ShouldQueueEvent func(evt *event.Event) bool
 
 	Live  bool
 	Ready bool
@@ -314,6 +341,21 @@ func (as *AppService) Intent(userID id.UserID) *IntentAPI {
 	return intent
 }
 
+// ForgetIntent removes the cached [IntentAPI] and [mautrix.Client] for the given user ID, so that the memory
+// can be freed. The next call to [AppService.Intent] or [AppService.Client] will create new instances.
+// The bot user is never forgotten.
+func (as *AppService) ForgetIntent(userID id.UserID) {
+	if userID == as.BotMXID() {
+		return
+	}
+	as.intentsLock.Lock()
+	delete(as.intents, userID)
+	as.intentsLock.Unlock()
+	as.clientsLock.Lock()
+	delete(as.clients, userID)
+	as.clientsLock.Unlock()
+}
+
 // BotIntent returns an [IntentAPI] object for the appservice's sender_localpart user.
 func (as *AppService) BotIntent() *IntentAPI {
 	if as.botIntent == nil {
@@ -342,16 +384,29 @@ func (as *AppService) SetHomeserverURL(homeserverURL string) error {
 	}
 	as.hsURLForClient.RawPath = as.hsURLForClient.EscapedPath()
 
-	jar, _ := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
-	as.HTTPClient = &http.Client{Timeout: 180 * time.Second, Jar: jar}
+	var base *http.Transport
 	if parsedURL.Scheme == "unix" {
-		as.HTTPClient.Transport = &http.Transport{
+		base = &http.Transport{
 			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
 				return net.Dial("unix", parsedURL.Path)
 			},
 		}
 	}
+	as.HTTPClient = as.newHomeserverHTTPClient(base)
 	return nil
+}
+
+// newHomeserverHTTPClient creates the HTTP client used for homeserver requests. base is the transport to build on
+// (nil means Go's default transport). With HomeserverMaxConnsPerPool > 0, every lane gets a capped clone of it.
+func (as *AppService) newHomeserverHTTPClient(base *http.Transport) *http.Client {
+	jar, _ := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
+	client := &http.Client{Timeout: 180 * time.Second, Jar: jar}
+	if as.HomeserverMaxConnsPerPool > 0 {
+		client.Transport = mautrix.NewIntboxLaneTransport(base, as.HomeserverMaxConnsPerPool)
+	} else if base != nil {
+		client.Transport = base
+	}
+	return client
 }
 
 // NewMautrixClient creates a new [mautrix.Client] instance for the given user ID.
@@ -378,19 +433,63 @@ func (as *AppService) NewMautrixClient(userID id.UserID) *mautrix.Client {
 //
 // This is primarily meant to facilitate double puppeting in bridges, and is used by [bridge.doublePuppetUtil].
 // Non-bridge appservices will likely not need this.
+//
+// A homeserverURL with the same scheme and host as the appservice's own homeserver (for example when the bridge's
+// own server is listed in double_puppet.servers) keeps the appservice's HTTP client, so double puppets share its
+// capped connection pools. Other homeservers share one separate client (see externalHTTPClient).
 func (as *AppService) NewExternalMautrixClient(userID id.UserID, token string, homeserverURL string) (*mautrix.Client, error) {
 	client := as.NewMautrixClient(userID)
 	client.AccessToken = token
 	client.SetAppServiceUserID = false
 	if homeserverURL != "" {
-		client.Client = &http.Client{Timeout: 180 * time.Second}
-		var err error
-		client.HomeserverURL, err = mautrix.ParseAndNormalizeBaseURL(homeserverURL)
+		parsedURL, err := mautrix.ParseAndNormalizeBaseURL(homeserverURL)
 		if err != nil {
 			return nil, err
 		}
+		client.HomeserverURL = parsedURL
+		if !sameHomeserverHost(parsedURL, as.hsURLForClient) {
+			client.Client = as.externalHTTPClient()
+		}
 	}
 	return client, nil
+}
+
+// externalHTTPClient returns the HTTP client shared by all clients for other homeservers (double puppets on other
+// servers): the same 180 s timeout as before, and with HomeserverMaxConnsPerPool > 0 its own
+// [mautrix.IntboxLaneTransport], so the per-host caps apply there too. It used to be a new client with Go's default
+// transport (no cap) per double puppet.
+func (as *AppService) externalHTTPClient() *http.Client {
+	as.externalHTTPClientLock.Lock()
+	defer as.externalHTTPClientLock.Unlock()
+	if as.externalClient == nil {
+		as.externalClient = &http.Client{Timeout: 180 * time.Second}
+		if as.HomeserverMaxConnsPerPool > 0 {
+			as.externalClient.Transport = mautrix.NewIntboxLaneTransport(nil, as.HomeserverMaxConnsPerPool)
+		}
+	}
+	return as.externalClient
+}
+
+// sameHomeserverHost reports whether two homeserver base URLs reach the same server: same scheme, host and port
+// (the default port when none is given), compared case-insensitively. Paths don't matter: the HTTP client's
+// connections are per host.
+func sameHomeserverHost(a, b *url.URL) bool {
+	if a == nil || b == nil || !strings.EqualFold(a.Scheme, b.Scheme) {
+		return false
+	}
+	hostPort := func(u *url.URL) string {
+		port := u.Port()
+		if port == "" {
+			switch strings.ToLower(u.Scheme) {
+			case "http":
+				port = "80"
+			case "https":
+				port = "443"
+			}
+		}
+		return net.JoinHostPort(strings.ToLower(u.Hostname()), port)
+	}
+	return hostPort(a) == hostPort(b)
 }
 
 func (as *AppService) makeClient(userID id.UserID) *mautrix.Client {

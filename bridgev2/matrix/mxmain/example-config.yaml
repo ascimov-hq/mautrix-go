@@ -60,6 +60,20 @@ bridge:
     enable_send_state_requests: false
     # Should the com.beeper.bridge.identifiers list in global ghost profiles include phone numbers?
     phone_numbers_in_profile: false
+    # Maximum number of ghosts to keep in the in-memory cache. When the cache is full, the least
+    # recently used ghosts are evicted (they're loaded from the database again when needed).
+    # 0 means the cache is unbounded and only cleared on restart.
+    ghost_cache_size: 0
+    # When a ghost that isn't in the room yet sends something (e.g. a group member that wasn't synced
+    # eagerly), should the bridge bot invite it and the ghost join with a member event that carries the
+    # same extra info as the member list sync (com.zeldin.bridge_ids, exclude_from_timeline)?
+    # If false (the default, upstream behaviour), the ghost tries a plain /join first, which fails in
+    # private rooms before the bot invites it.
+    lazy_join_with_invite: false
+    # Should read receipts and typing notifications from remote users whose ghosts aren't joined to the portal
+    # be ignored? This avoids creating, registering and joining ghosts for silent group members.
+    # Disabled by default (upstream behaviour).
+    ignore_ephemeral_from_non_members: false
 
     # What should be done to portal rooms when a user logs out or is logged out?
     # Permitted values:
@@ -208,6 +222,13 @@ homeserver:
     # When requests to the homeserver fail with a 502/503/504/429 status or a network error,
     # how many times should the bridge retry the request before giving up?
     retry_limit: 4
+    # Maximum number of concurrent connections to the homeserver per connection pool. There are four pools:
+    # live traffic (including all encryption requests), bulk writes (room setup, member and profile sync),
+    # backfill writes (history), and background reads and ghost registrations. So background work that a
+    # reverse proxy delays can never hold up live messages. Requests over the limit wait inside the bridge
+    # for a free connection of their pool instead of opening more sockets.
+    # 0 disables the limit and the separate pools (Go's default HTTP transport: unlimited connections).
+    max_connections_per_pool: 64
 
 # Application service host/registration related details.
 # Changing these values requires regeneration of the registration (except when noted otherwise)
@@ -297,6 +318,11 @@ provisioning:
     # Enable session transfers between bridges. Note that this only validates Matrix or shared secret
     # auth before passing live network client credentials down in the response.
     enable_session_transfers: false
+    # Should starting a login process cancel the user's older unfinished login processes?
+    # Step requests for a cancelled process get HTTP 410 FI.MAU.BRIDGE.LOGIN_SUPERSEDED for 5 minutes.
+    # A process that the network connector reports as completing (e.g. WhatsApp after the phone
+    # accepted the pairing code) is never cancelled.
+    supersede_logins: true
 
 # Some networks require publicly accessible media download links (e.g. for user avatars when using Discord webhooks).
 # These settings control whether the bridge will provide such public media access.

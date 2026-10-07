@@ -121,10 +121,34 @@ func (as *AppService) PutTransaction(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to parse transaction content")
 		mautrix.MBadJSON.WithMessage("Failed to parse transaction content").Write(w)
-	} else {
-		as.handleTransaction(ctx, txnID, &txn)
-		exhttp.WriteEmptyJSONResponse(w, http.StatusOK)
+		return
 	}
+	// The homeserver retries a transaction if the previous attempt timed out, even if we're still processing it.
+	// Make retries wait for the running attempt instead of processing the same events again in parallel,
+	// and only respond once the transaction has actually been handled.
+	for {
+		wait, alreadyProcessed := as.txnIDC.StartProcessing(txnID)
+		if alreadyProcessed {
+			exhttp.WriteEmptyJSONResponse(w, http.StatusOK)
+			log.Debug().Msg("Ignoring duplicate transaction")
+			return
+		} else if wait == nil {
+			break
+		}
+		log.Debug().Msg("Transaction is already being processed, waiting for the previous attempt to finish")
+		select {
+		case <-wait:
+			// Loop around: the transaction is normally marked as processed now,
+			// but if the previous attempt didn't finish properly, this request will handle it.
+		case <-r.Context().Done():
+			log.Debug().Msg("Retried transaction request was cancelled before the previous attempt finished")
+			mautrix.MUnknown.WithMessage("Transaction is still being processed").Write(w)
+			return
+		}
+	}
+	defer as.txnIDC.FinishProcessing(txnID)
+	as.handleTransaction(ctx, txnID, &txn)
+	exhttp.WriteEmptyJSONResponse(w, http.StatusOK)
 }
 
 func (as *AppService) handleTransaction(ctx context.Context, id string, txn *Transaction) {
@@ -217,6 +241,9 @@ func (as *AppService) handleEvents(ctx context.Context, evts []*event.Event, def
 		if evt.Type.Class == event.ToDeviceEventType {
 			ch = as.ToDeviceEvents
 		} else {
+			if as.ShouldQueueEvent != nil && !as.ShouldQueueEvent(evt) {
+				continue
+			}
 			ch = as.Events
 		}
 		select {

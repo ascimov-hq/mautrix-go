@@ -169,6 +169,14 @@ func (portal *PortalInternals) GetIntentAndUserMXIDFor(ctx context.Context, send
 	return (*Portal)(portal).getIntentAndUserMXIDFor(ctx, sender, source, otherLogins, evtType)
 }
 
+func (portal *PortalInternals) LazyJoinGhost(ctx context.Context, intent MatrixAPI, source *UserLogin, evtType RemoteEventType) {
+	(*Portal)(portal).lazyJoinGhost(ctx, intent, source, evtType)
+}
+
+func (portal *PortalInternals) IsNonMemberGhostSender(ctx context.Context, sender EventSender) bool {
+	return (*Portal)(portal).isNonMemberGhostSender(ctx, sender)
+}
+
 func (portal *PortalInternals) GetRelationMeta(ctx context.Context, currentMsgID networkid.MessageID, currentMsg *ConvertedMessage, isBatchSend bool) (replyTo, threadRoot, prevThreadEvent *database.Message) {
 	return (*Portal)(portal).getRelationMeta(ctx, currentMsgID, currentMsg, isBatchSend)
 }
@@ -385,16 +393,28 @@ func (portal *PortalInternals) SendBackfill(ctx context.Context, source *UserLog
 	return (*Portal)(portal).sendBackfill(ctx, source, messages, forceForward, markRead, inThread, done)
 }
 
+func (portal *PortalInternals) EnsureBatchSenderJoined(ctx context.Context, intent MatrixAPI, out *compileBatchOutput) {
+	(*Portal)(portal).ensureBatchSenderJoined(ctx, intent, out)
+}
+
 func (portal *PortalInternals) CompileBatchMessage(ctx context.Context, source *UserLogin, msg *BackfillMessage, out *compileBatchOutput, inThread bool) {
 	(*Portal)(portal).compileBatchMessage(ctx, source, msg, out, inThread)
 }
 
-func (portal *PortalInternals) FetchThreadInsideBatch(ctx context.Context, source *UserLogin, dbMsg *database.Message, out *compileBatchOutput) {
-	(*Portal)(portal).fetchThreadInsideBatch(ctx, source, dbMsg, out)
+func (portal *PortalInternals) CompileBatchReactions(ctx context.Context, source *UserLogin, pending *pendingBatchReactions, out *compileBatchOutput) {
+	(*Portal)(portal).compileBatchReactions(ctx, source, pending, out)
+}
+
+func (portal *PortalInternals) BatchSendTxnID(out *compileBatchOutput) string {
+	return (*Portal)(portal).batchSendTxnID(out)
 }
 
 func (portal *PortalInternals) SendBatch(ctx context.Context, source *UserLogin, messages []*BackfillMessage, forceForward, markRead, inThread bool) error {
 	return (*Portal)(portal).sendBatch(ctx, source, messages, forceForward, markRead, inThread)
+}
+
+func (portal *PortalInternals) SendBatchSegment(ctx context.Context, source *UserLogin, out *compileBatchOutput, forceForward, markRead, sendNotification bool) error {
+	return (*Portal)(portal).sendBatchSegment(ctx, source, out, forceForward, markRead, sendNotification)
 }
 
 func (portal *PortalInternals) SendLegacyBackfill(ctx context.Context, source *UserLogin, messages []*BackfillMessage, markRead bool) error {
